@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -m pytest -q)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_pool.py -q)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/tax_calc_at/ui/app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -m pytest -q)",
+      "Bash(python -m pytest)",
+      "Bash(python scripts/smoke_e2e.py)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import openpyxl; print\\(openpyxl.__version__\\)\")",
+      "Bash(python -c \"import xlsxwriter; print\\(xlsxwriter.__version__\\)\")",
+      "Bash(python -m pytest tests/)",
+      "Bash(python -m pytest tests/test_export_worksheet.py -v)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Andre\\PycharmProjects\\Tax-Calculator-Austria\\data"
+    ]
+  }
+}

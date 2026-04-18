@@ -1,0 +1,148 @@
+# Austrian capital-income tax rules — tax year 2024.
+#
+# Kennzahl mapping is best-effort and provided without warranty. Validate all
+# Kennzahlen against the official BMF forms/notes for your filing period.
+#
+# Sources consulted:
+#   - BMF E1kv form (2024 edition) + Erläuterungen
+#   - Linde DB Dok. 186660 (Erläuterungen E1kv)
+#   - kestaustria.at, broker-test.at, onlinebrokertest.at (informational only)
+
+year: 2024
+
+rates:  # Informational only — the engine does not compute the final tax owed
+  # (FinanzOnline does that from the Kennzahl figures). These values document
+  # the applicable special rates so reviewers can sanity-check the basket
+  # split below.  # § 27a Abs. 1 EStG — special tax rate for capital income
+  kapitalvermoegen_general: 0.275   # Aktien, Fonds, ETFs, Dividenden, Kursgewinne
+  zinsen_geldeinlagen: 0.25         # Bankzinsen (Sparbuch, Girokonto, Geldmarkt)
+
+# Foreign withholding tax credit
+foreign_withholding:
+  # Default cap per DBA (most treaties allow 15% credit on dividends).
+  default_creditable_cap: 0.15
+  # Per-country caps (ISO-2). Values are the DBA-anrechenbar ceiling, NOT the
+  # broker-withheld rate. Excess (e.g. the 20 % refundable part of the Swiss
+  # Verrechnungssteuer) must be reclaimed from the foreign authority — not
+  # credited against Austrian KESt. Cross-check with the current BMF
+  # Durchführungserlass before relying in filing.
+  country_caps:
+    "US": 0.15   # DBA AT-US, Art 10: 15 % on portfolio dividends
+    "CH": 0.15   # DBA AT-CH, Art 10; 20 % refundable via Form 85
+    "DE": 0.15   # DBA AT-DE, Art 10
+    "FR": 0.15   # DBA AT-FR, Art 10
+    "IT": 0.15   # DBA AT-IT, Art 10
+    "ES": 0.15   # DBA AT-ES, Art 10
+    "GB": 0.0    # DBA AT-UK: UK does not levy WHT on dividends
+    "IE": 0.0    # Ireland: no WHT on outbound dividends (subject to conditions)
+    "NL": 0.15   # DBA AT-NL, Art 10
+    "LU": 0.15   # DBA AT-LU, Art 10
+    "BE": 0.15   # DBA AT-BE, Art 10
+    "CA": 0.15   # DBA AT-CA, Art 10
+    "JP": 0.10   # DBA AT-JP, Art 10: 10 % cap
+    "AU": 0.15   # DBA AT-AU, Art 10
+    "SE": 0.15   # DBA AT-SE, Art 10
+    "DK": 0.15   # DBA AT-DK, Art 10
+    "FI": 0.15   # DBA AT-FI, Art 10
+    "NO": 0.15   # DBA AT-NO, Art 10
+
+# Mapping bucket -> Kennzahl number on Beilage E 1kv 2024.
+# `credit_bucket` (optional) names the bucket that absorbs creditable foreign
+# withholding tax for income classified into THIS bucket.
+kennzahlen:
+  # Special-rate (27.5%) foreign income
+  einkuenfte_ueberlassung_27_5:
+    nr: 863
+    label: "Einkünfte aus der Überlassung von Kapital (27,5 %), ausländisch"
+    credit_bucket: anrechenbare_quellensteuer_27_5
+  einkuenfte_realisierte_wertsteigerungen_27_5:
+    nr: 865
+    label: "Realisierte Wertsteigerungen (legacy aggregate, fallback)"
+    credit_bucket: anrechenbare_quellensteuer_27_5
+    tbv: true
+  einkuenfte_realisierte_wertsteigerungen_27_5_gewinne:
+    nr: 994
+    label: "Realisierte Wertsteigerungen Gewinne (27,5 %)"
+    credit_bucket: anrechenbare_quellensteuer_27_5
+  einkuenfte_realisierte_wertsteigerungen_27_5_verluste:
+    nr: 892
+    label: "Realisierte Wertsteigerungen Verluste (27,5 %)"
+    credit_bucket: anrechenbare_quellensteuer_27_5
+  einkuenfte_derivate_27_5:
+    nr: 864
+    label: "Einkünfte aus Derivaten (27,5 %), ausländisch"
+    credit_bucket: anrechenbare_quellensteuer_27_5
+  # 25% bucket (bank interest, savings)
+  zinsen_geldeinlagen_25:
+    nr: 857
+    label: "Zinsen aus Geldeinlagen bei Kreditinstituten (25 %), ausländisch"
+    credit_bucket: anrechenbare_quellensteuer_25
+  # Foreign withholding tax that may be credited
+  anrechenbare_quellensteuer_27_5:
+    nr: 998
+    label: "Anrechenbare ausländische (Quellen-)Steuer auf 27,5 %-Einkünfte"
+  anrechenbare_quellensteuer_25:
+    nr: 799
+    label: "Anrechenbare ausländische (Quellen-)Steuer auf 25 %-Einkünfte"
+
+# Loss-offset rules for private investors (§ 27 Abs. 8 EStG).
+# NOTE: cross_broker / cross_year are currently INFORMATIONAL only — they
+# control the report’s loss-offset note text but not aggregation. Cross-broker
+# aggregation is always performed; carry-forward (cross_year) is not yet
+# implemented (private investors usually cannot carry losses forward anyway).
+loss_offset:
+  cross_broker: true
+  cross_year: false
+  # Losses from realized gains (865) may offset dividends (863) only within
+  # the 27.5% basket; never against 25% interest.
+  cross_bucket_within_275: true
+  cross_bucket_within_275_buckets:
+    - einkuenfte_realisierte_wertsteigerungen_27_5_verluste
+    - einkuenfte_ueberlassung_27_5
+
+# Classification rules. First match wins.
+# Supported match keys: tx_type, asset_class (single value or list).
+classification:
+  - when: { tx_type: SELL, asset_class: [STOCK, ETF, BOND] }
+    bucket: einkuenfte_realisierte_wertsteigerungen_27_5
+
+  - when: { tx_type: DIVIDEND_CASH }
+    bucket: einkuenfte_ueberlassung_27_5
+
+  # Stock dividends (Aktiendividenden) — v1 treats them as zero-cost lots on
+  # the pool side (no immediate income event). Bucket null = no E1kv entry.
+  - when: { tx_type: DIVIDEND_STOCK }
+    bucket: null
+    note: "v1: handled as zero-cost lot on the pool side"
+
+  # Return of capital / Einlagenrückzahlung (§ 4 Abs. 12 EStG) — NOT taxable
+  # as Kapitalertrag. The pool layer automatically reduces the position's
+  # cost basis by the payout; any excess over remaining basis is emitted as
+  # a realized capital gain in the 27,5 %-Wertsteigerungs-bucket (§ 27 Abs.
+  # 5 Z 1 EStG). This classification entry keeps RoC OUT of the dividend
+  # bucket (bucket: null).
+  - when: { tx_type: RETURN_OF_CAPITAL }
+    bucket: null
+    note: "RoC reduces cost basis; excess becomes realized gain via pool layer"
+
+  # § 27a Abs. 1 Z 1 EStG — Zinsen aus Geldeinlagen bei Kreditinstituten:
+  # 25 % besonderer Steuersatz → KZ 857. Use this ONLY for a genuine bank
+  # deposit; broker cash interest and share-lending income go into
+  # INTEREST_OTHER below.
+  - when: { tx_type: INTEREST }
+    bucket: zinsen_geldeinlagen_25
+
+  # § 27a Abs. 1 Z 2 EStG — 27,5 %-Topf: Zinsen aus sonstigen
+  # Kapitalforderungen, Bond-Kupons, Broker-Cash-Zinsen, share-lending etc.
+  - when: { tx_type: INTEREST_OTHER }
+    bucket: einkuenfte_ueberlassung_27_5
+    note: "Non-bank interest: bond coupons, broker cash, share-lending, etc."
+
+  # Bonus shares / Stockperk: no income event in v1 (zero-cost lot is created
+  # on the pool side). Keep here as IGNORED so engine knows the row was seen.
+  - when: { tx_type: BONUS_SHARE }
+    bucket: null
+    note: "v1: treated as zero-cost lot, no income at receipt; user must review"
+
+  - when: { tx_type: [DEPOSIT_CASH, WITHDRAWAL_CASH, FEE, SPLIT, IGNORED, MIGRATION_IN, MIGRATION_OUT, BUY] }
+    bucket: null

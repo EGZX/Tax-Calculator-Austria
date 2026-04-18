@@ -1,0 +1,46 @@
+[project]
+name = "tax-calc-at"
+version = "0.1.0"
+description = "Austrian foreign-broker capital-gains (E1kv) tax calculator"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.36",
+    "pandas>=2.2",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "requests>=2.32",
+    "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "types-PyYAML",
+    "types-requests",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src/tax_calc_at"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,18 @@
+# Per-ISIN asset-class override.
+#
+# Many broker exports (Trading 212 especially) do not emit an asset-class
+# field. asset_class_from_isin() then falls back to STOCK for any valid
+# ISIN, which can silently route ETFs / bonds into the realised-gains
+# bucket without triggering the engine's ETF blocker.
+#
+# Add an entry here to pin the correct asset class for an ISIN. Allowed
+# values: STOCK, ETF, BOND, CASH, CRYPTO, OTHER.
+#
+# Example:
+#   IE00B4L5Y983: ETF       # iShares Core MSCI World UCITS ETF
+#   LU0274208692: ETF       # Xtrackers MSCI World UCITS ETF
+#   DE0001102606: BOND      # Bundesanleihe 0% 2031
+
+overrides:
+  # InPost S.A. (stock) — not an ETF.
+  LU2290522684: STOCK

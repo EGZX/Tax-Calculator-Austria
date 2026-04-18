@@ -1,0 +1,38 @@
+# Per-broker metadata.
+# `parser` selects an implementation in src/tax_calc_at/parsers/.
+# `steuereinfach_from`: trade_date >= this date is treated as TR-handled. The
+#   default service path emits those rows as TxType.IGNORED with a WARNING
+#   flag (and counts them in rows_rejected) so they appear in the audit tab
+#   but never affect tax math. Pass strict_cutoff=True to the parser to make
+#   it raise CutoffViolationError on the first such row instead.
+# `jurisdiction`: 'foreign' = treated as auslandsdepot (E1kv). 'domestic' is
+#   accepted by the schema but no broker implementation enforces it today \u2014
+#   the field is informational and reserved for future scope.
+# `default_currency`: documentation only \u2014 actual currency is taken from each
+#   transaction row and converted via ECB.
+
+brokers:
+  ibkr:
+    parser: ibkr_flex
+    display_name: Interactive Brokers
+    jurisdiction: foreign
+    default_currency: USD
+
+  scalable_capital:
+    parser: scalable
+    display_name: Scalable Capital
+    jurisdiction: foreign
+    default_currency: EUR
+
+  trade_republic:
+    parser: trade_republic
+    display_name: Trade Republic
+    jurisdiction: foreign
+    default_currency: EUR
+    steuereinfach_from: 2025-04-29  # TR became steuereinfach in AT on this date
+
+  trading212:
+    parser: trading212
+    display_name: Trading 212
+    jurisdiction: foreign
+    default_currency: EUR

@@ -1,0 +1,25 @@
+# Optional manual overrides for Scalable `Distribution` rows.
+#
+# Default parser behavior is: Distribution -> DIVIDEND_CASH.
+# Add a row here only when broker/issuer evidence confirms that a specific
+# payout is actually return of capital (Einlagenrueckzahlung).
+#
+# Matching fields:
+# - isin: required
+# - date_from/date_to: optional ISO dates (inclusive)
+# - reference_regex: optional Python regex matched against `reference`
+# - description_regex: optional Python regex matched against `description`
+#
+# Supported tx_type values:
+# - RETURN_OF_CAPITAL
+
+overrides: []
+
+# Example:
+# overrides:
+#   - isin: CNE100000296
+#     date_from: 2025-09-15
+#     date_to: 2025-09-15
+#     reference_regex: '^WWEK 50958290$'
+#     tx_type: RETURN_OF_CAPITAL
+#     note: "Confirmed by broker tax statement"
