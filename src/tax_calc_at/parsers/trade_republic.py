@@ -113,7 +113,77 @@ def parse(
             else:
                 report.rows_emitted += 1
 
+    _repair_stockperk_paired_buy(txns)
     return txns, report
+
+
+def _repair_stockperk_paired_buy(txns: list[Transaction]) -> None:
+    """Rewrite the BUY that materializes a Stockperk gift as a zero-cost lot.
+
+    Trade Republic books a promotional free share as two CSV rows:
+      1. STOCKPERK (category=CASH, no shares, amount = EUR FMV of the gift).
+      2. BUY       (category=TRADING, shares=<fractional>, amount=-EUR FMV).
+
+    Parsed naively this (a) adds real cost basis = FMV to the pool via the
+    BUY, (b) surfaces no income for the gift, and (c) leaves the later
+    SELL over-reporting nothing but also never reporting the gift as
+    income. The pragmatic AT treatment for broker-native Stockperks is a
+    zero-cost lot (no receipt income, full proceeds taxable at sale).
+
+    This post-processor finds each tagged STOCKPERK row and, for the
+    first BUY on the same ISIN within a 3-day window whose gross value
+    matches the Stockperk FMV to the cent, rewrites the BUY to
+    BONUS_SHARE with zero gross. Unpaired Stockperks stay untouched
+    (defensive — a genuine shares-bearing STOCKPERK row is already a
+    zero-cost BONUS_SHARE on its own).
+    """
+    TOL = Decimal("0.01")
+    stockperks = [
+        t for t in txns
+        if any(f.code == "tr.stockperk" for f in t.flags)
+        and t.quantity == 0
+        and t.gross_native > 0
+        and t.isin
+    ]
+    if not stockperks:
+        return
+    for sp in stockperks:
+        match: Transaction | None = None
+        for tx in txns:
+            if tx is sp:
+                continue
+            if tx.tx_type is not TxType.BUY:
+                continue
+            if tx.isin != sp.isin:
+                continue
+            delta_days = abs((tx.trade_date - sp.trade_date).days)
+            if delta_days > 3:
+                continue
+            if (abs(tx.gross_native) - sp.gross_native).copy_abs() > TOL:
+                continue
+            match = tx
+            break
+        if match is None:
+            continue
+        match.tx_type = TxType.BONUS_SHARE
+        match.gross_native = Decimal("0")
+        match.price_native = None
+        match.notes = (
+            "Trade Republic Stockperk: converted paired BUY into zero-cost "
+            "BONUS_SHARE. FMV of the gift is NOT booked as cost basis."
+        )
+        match.add_flag(
+            "tr.stockperk_paired_buy",
+            Severity.INFO,
+            f"Paired with Stockperk row {sp.source_file}:{sp.source_line}; "
+            "basis set to 0 (Nullkostenzuwendung).",
+        )
+        sp.add_flag(
+            "tr.stockperk_paired",
+            Severity.INFO,
+            f"Paired BUY row {match.source_file}:{match.source_line} "
+            "rewritten to zero-cost BONUS_SHARE.",
+        )
 
 
 def _parse_row(
@@ -261,6 +331,18 @@ def _parse_row(
     )
     if flag:
         tx.flags.append(flag)
+    if raw_type == "STOCKPERK":
+        # Tag so the post-processor can pair this BONUS_SHARE with the
+        # subsequent BUY that records the promotional shares as if the user
+        # had paid for them. The paired BUY is rewritten to a zero-cost
+        # BONUS_SHARE (§ 27 Abs. 3 EStG — zero Anschaffungskosten for a
+        # Nullkostenzuwendung) so the later SELL's basis is not inflated by
+        # the gift value.
+        tx.add_flag(
+            "tr.stockperk",
+            Severity.INFO,
+            "Trade Republic Stockperk promotional gift (pool-side repair).",
+        )
     if tx_type is TxType.DIVIDEND_CASH:
         # TR reports the NET cash amount in `amount` after foreign withholding;
         # the `tax` field holds the withheld portion separately.

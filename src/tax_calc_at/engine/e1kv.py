@@ -194,6 +194,19 @@ def build_report(
     for tx in txns:
         if tx.tx_type is TxType.SELL:
             continue  # handled above via realized events
+        # RoC uncertainty must be checked BEFORE the bucket=null skip:
+        # the pool has already reduced basis using the reported (possibly
+        # net-of-WHT) amount, so emitting a clean report would silently
+        # distort every future SELL's gain figure.
+        if tx.tx_type is TxType.RETURN_OF_CAPITAL and _parser_declared_roc_ambiguous(tx):
+            report.health.blockers.append(
+                f"Return-of-capital {tx.broker} {tx.source_file}:{tx.source_line} "
+                f"(ISIN {tx.isin or '?'}) may be net of foreign withholding. "
+                f"The pool reduced cost basis by the reported amount; this "
+                f"silently distorts future realized-gain figures. Verify "
+                f"against the broker's annual tax report and correct the row "
+                f"(or exclude it) before filing."
+            )
         bucket_name = rules.classify(tx.tx_type, tx.asset_class)
         if bucket_name is None:
             continue
@@ -215,6 +228,30 @@ def build_report(
                 elif tx.dividend_is_net:
                     amt = amt + wh
                 # if dividend_is_net is False, gross_native already includes wh
+            elif _parser_declared_unknown_withholding(tx):
+                # Parser flagged that this broker's CSV does not disclose the
+                # foreign withholding tax. We cannot gross up and we cannot
+                # credit — silently summing the (net) amount would under-
+                # report income and forgo the KZ 998 credit. Block unless
+                # the treaty cap is zero (IE / GB outbound dividends), in
+                # which case nothing is lost.
+                country = (tx.withholding_country or "").upper()
+                country_cap = rules.foreign_withholding.country_caps.get(country)
+                effective_cap = (
+                    country_cap
+                    if country_cap is not None
+                    else rules.foreign_withholding.default_creditable_cap
+                )
+                if effective_cap > 0:
+                    report.health.blockers.append(
+                        f"Dividend {tx.broker} {tx.source_file}:{tx.source_line} "
+                        f"(country={tx.withholding_country or '?'}) is reported "
+                        f"net of foreign withholding, but the broker CSV does "
+                        f"not disclose the withholding amount. Gross-up and "
+                        f"KZ 998 credit cannot be computed from this row. "
+                        f"Supply the broker's annual tax report (with gross / "
+                        f"WHT broken out) or remove the row before filing."
+                    )
         bucket.total_eur += amt
         bucket.contributions.append(
             Contribution(
@@ -363,6 +400,29 @@ def _detect_asset_class_for_realized(ev: RealizedEvent):  # pragma: no cover
     # Deprecated: kept only as a backstop. Realized events now carry their
     # originating asset_class so the YAML classifier sees the right value.
     return ev.asset_class
+
+
+_WITHHOLDING_UNKNOWN_FLAG_CODES = frozenset({
+    # Trading 212 CSV exports do not break out foreign withholding tax on
+    # dividend rows; the "Total" column is already net. Without a paired
+    # annual tax report we cannot gross up or credit.
+    "t212.missing_withholding_detail",
+})
+
+_ROC_AMBIGUOUS_FLAG_CODES = frozenset({
+    # Trading 212 RoC rows may be net of foreign withholding. The pool
+    # reduces basis by the reported value, so a net figure silently
+    # inflates future realized gains.
+    "t212.roc_net_gross_ambiguous",
+})
+
+
+def _parser_declared_unknown_withholding(tx: Transaction) -> bool:
+    return any(f.code in _WITHHOLDING_UNKNOWN_FLAG_CODES for f in tx.flags)
+
+
+def _parser_declared_roc_ambiguous(tx: Transaction) -> bool:
+    return any(f.code in _ROC_AMBIGUOUS_FLAG_CODES for f in tx.flags)
 
 
 def _get_or_create(report: E1kvReport, rules: TaxRules, bucket_name: str) -> BucketResult:

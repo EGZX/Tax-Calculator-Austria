@@ -436,6 +436,105 @@ classification:
         load(9999, path=p)
 
 
+def test_t212_dividend_without_withholding_detail_blocks_filing():
+    """Trading 212 dividend row with the missing-WH flag → blocker, not silent."""
+    rules = load_tax_rules(2024)
+    tx = _div(net_eur="85", wh_eur="0", country="US")
+    # _div defaults dividend_is_net=True; the engine sees wh==0 so the old
+    # gross-up branch would silently treat net as gross. The parser flag
+    # declares that the WHT is UNKNOWN — must become a blocker.
+    from tax_calc_at.model import Flag, Severity
+    tx.flags.append(Flag(
+        code="t212.missing_withholding_detail",
+        severity=Severity.WARNING,
+        message="test",
+    ))
+    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
+    assert not rep.health.fileable
+    assert any(
+        "does not disclose the withholding amount" in b
+        for b in rep.health.blockers
+    )
+
+
+def test_t212_dividend_flag_does_not_block_zero_cap_country():
+    """IE / GB have 0% cap — nothing to lose to under-reporting, no blocker."""
+    rules = load_tax_rules(2024)
+    # Ireland: country_cap=0.0 in rules.
+    tx = _div(net_eur="85", wh_eur="0", country="IE", isin="IE00B4L5Y983")
+    from tax_calc_at.model import Flag, Severity
+    tx.flags.append(Flag(
+        code="t212.missing_withholding_detail",
+        severity=Severity.WARNING,
+        message="test",
+    ))
+    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
+    assert not any(
+        "does not disclose the withholding amount" in b
+        for b in rep.health.blockers
+    )
+
+
+def test_t212_roc_ambiguous_blocks_filing():
+    """RoC row with the ambiguous-net/gross flag → blocker."""
+    rules = load_tax_rules(2024)
+    tx = _roc(amount_eur="40")
+    from tax_calc_at.model import Flag, Severity
+    tx.flags.append(Flag(
+        code="t212.roc_net_gross_ambiguous",
+        severity=Severity.WARNING,
+        message="test",
+    ))
+    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
+    assert not rep.health.fileable
+    assert any(
+        "may be net of foreign withholding" in b
+        for b in rep.health.blockers
+    )
+
+
+def test_trade_republic_stockperk_paired_buy_zero_cost(tmp_path):
+    """STOCKPERK (FMV in EUR) + paired BUY must produce a zero-cost lot."""
+    from datetime import date as _date
+    from tax_calc_at.parsers.trade_republic import parse as tr_parse
+
+    csv = tmp_path / "tr.csv"
+    csv.write_text(
+        '"datetime","date","account_type","category","type","asset_class","name","symbol","shares","price","amount","fee","tax","currency","original_amount","original_currency","fx_rate","description","transaction_id","counterparty_name","counterparty_iban","payment_reference","mcc_code"\n'
+        '"2023-12-28T16:12:09.559467Z","2023-12-28","DEFAULT","CASH","STOCKPERK","STOCK","Tesla","US88160R1014","","","10.170000","","","EUR","","","","Stockperk","ref-sp","","","",""\n'
+        '"2023-12-28T16:21:32.873Z","2023-12-28","DEFAULT","TRADING","BUY","STOCK","Tesla","US88160R1014","0.0435000000","233.750000","-10.17","","","EUR","","","","","ref-buy","","","",""\n',
+        encoding="utf-8",
+    )
+    txns, _ = tr_parse(csv, steuereinfach_from=_date(2025, 4, 29))
+    assert len(txns) == 2
+    buy = next(t for t in txns if t.raw_ref == "ref-buy")
+    # Paired BUY must now be a zero-cost BONUS_SHARE so later SELLs do not
+    # inherit the 10.17 EUR of spurious basis.
+    assert buy.tx_type is TxType.BONUS_SHARE
+    assert buy.gross_native == Decimal("0")
+    assert buy.quantity == Decimal("0.0435")
+    assert any(f.code == "tr.stockperk_paired_buy" for f in buy.flags)
+
+
+def test_trade_republic_stockperk_unpaired_is_unchanged(tmp_path):
+    """A Stockperk without a matching BUY (shares in STOCKPERK row itself)
+    must not be silently repaired — it is already a zero-cost lot."""
+    from datetime import date as _date
+    from tax_calc_at.parsers.trade_republic import parse as tr_parse
+
+    csv = tmp_path / "tr.csv"
+    csv.write_text(
+        '"datetime","date","account_type","category","type","asset_class","name","symbol","shares","price","amount","fee","tax","currency","original_amount","original_currency","fx_rate","description","transaction_id","counterparty_name","counterparty_iban","payment_reference","mcc_code"\n'
+        '"2025-01-02T10:00:00.000Z","2025-01-02","DEFAULT","TRADING","STOCKPERK","ETF","Physical Gold USD (Acc)","IE00B4ND3602","0.123","70.73","8.70","0","0","EUR","","","","","ref-1","","","",""\n',
+        encoding="utf-8",
+    )
+    txns, _ = tr_parse(csv, steuereinfach_from=_date(2025, 4, 29))
+    assert len(txns) == 1
+    assert txns[0].tx_type is TxType.BONUS_SHARE
+    assert txns[0].quantity == Decimal("0.123")
+    assert not any(f.code == "tr.stockperk_paired_buy" for f in txns[0].flags)
+
+
 def test_yaml_schema_validation_requires_full_txtype_coverage(tmp_path):
     """Missing a TxType in classification → hard error at load time."""
     from tax_calc_at.engine.rules import load_tax_rules as load
