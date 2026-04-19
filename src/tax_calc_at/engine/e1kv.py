@@ -375,11 +375,18 @@ def _get_or_create(report: E1kvReport, rules: TaxRules, bucket_name: str) -> Buc
 
 def _credit_cap(rules: TaxRules, tx: Transaction) -> Decimal:
     # Filing guardrail: creditable foreign withholding is globally capped at
-    # 15% of gross income, independent of source country. The YAML default may
-    # further restrict this cap for conservative what-if scenarios, but it can
-    # never raise it above 15%.
-    configured = rules.foreign_withholding.default_creditable_cap
-    return min(configured, MAX_CREDITABLE_WITHHOLDING_CAP)
+    # 15% of gross income, independent of source country. Per-country DBA
+    # caps (e.g. JP: 10%) are applied when the transaction carries a
+    # ``withholding_country``; they can only LOWER the effective cap, never
+    # raise it above the Austrian 15% ceiling. A user-configured default
+    # above 15% is likewise clamped.
+    default_cap = rules.foreign_withholding.default_creditable_cap
+    country = (tx.withholding_country or "").upper()
+    country_cap = (
+        rules.foreign_withholding.country_caps.get(country) if country else None
+    )
+    effective = country_cap if country_cap is not None else default_cap
+    return min(effective, MAX_CREDITABLE_WITHHOLDING_CAP)
 
 
 def _credit_bucket_for(rules: TaxRules, bucket_name: str) -> str | None:

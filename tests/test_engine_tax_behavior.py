@@ -86,9 +86,10 @@ def test_withholding_credit_capped_at_15_percent_default():
 
 
 def test_credit_cap_is_global_15_percent_even_with_country_override_present():
-    """Country-specific overrides are ignored; Austrian credit cap is global 15%."""
+    """Country-specific caps above 15% are clamped; Austrian ceiling stays 15%."""
     rules = load_tax_rules(2024)
-    # Even if a country-specific override exists, filing cap stays global 15%.
+    # Even if a country-specific cap is misconfigured above 15%, the hard
+    # Austrian ceiling wins. See also test_country_cap_never_raises_above_...
     rules.foreign_withholding.country_caps["CH"] = Decimal("0.25")
     tx = _div(
         net_eur="65", wh_eur="35", country="CH", isin="CH0038863350"
@@ -103,7 +104,40 @@ def test_credit_cap_never_exceeds_15_even_if_default_is_misconfigured_higher():
     rules = load_tax_rules(2024)
     # Simulate a bad config edit; engine must still enforce hard 15% ceiling.
     rules.foreign_withholding.default_creditable_cap = Decimal("0.30")
-    tx = _div(net_eur="70", wh_eur="30", country="US")  # gross 100, WH 30
+    # Country without a per-country cap → falls through to default → clamped.
+    tx = _div(net_eur="70", wh_eur="30", country="ZZ")  # gross 100, WH 30
+    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
+    credit = rep.creditable_withholding["anrechenbare_quellensteuer_27_5"]
+    assert credit == Decimal("15.00")
+
+
+def test_country_specific_cap_lowers_creditable_withholding():
+    """Japan DBA cap is 10%: withholding above 10% of gross is not creditable.
+
+    Gross 100, WH 15 → creditable = min(15, 100 * 10%) = 10.
+    The 5 EUR excess surfaces as uncreditable_withholding.
+    """
+    rules = load_tax_rules(2024)
+    assert rules.foreign_withholding.country_caps["JP"] == Decimal("0.10")
+    tx = _div(
+        net_eur="85", wh_eur="15", country="JP", isin="JP3633400001"
+    )  # gross 100
+    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
+    assert rep.creditable_withholding["anrechenbare_quellensteuer_27_5"] == Decimal(
+        "10.00"
+    )
+    assert rep.uncreditable_withholding["anrechenbare_quellensteuer_27_5"] == Decimal(
+        "5.00"
+    )
+
+
+def test_country_cap_never_raises_above_global_15_percent():
+    """Even if a country is (mis-)configured above 15%, the 15% ceiling wins."""
+    rules = load_tax_rules(2024)
+    rules.foreign_withholding.country_caps["CH"] = Decimal("0.25")
+    tx = _div(
+        net_eur="65", wh_eur="35", country="CH", isin="CH0038863350"
+    )  # gross 100
     rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
     credit = rep.creditable_withholding["anrechenbare_quellensteuer_27_5"]
     assert credit == Decimal("15.00")

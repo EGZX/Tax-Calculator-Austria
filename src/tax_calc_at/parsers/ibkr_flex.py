@@ -415,6 +415,23 @@ def _emit_cash_row(
             tax_total += abs(parse_decimal(_get(wh_row, cols, "Amount")))
             wh_country = wh_country or (_get(wh_row, cols, "IssuerCountryCode") or None)
         wh_country = wh_country or country_from_isin(isin)
+        div_flags: list[Flag] = []
+        if row_type == "Payment In Lieu Of Dividends":
+            # Payments in lieu of dividends are a securities-lending substitute,
+            # not an actual dividend. Austrian tax practice frequently denies
+            # DBA treaty protection (and therefore the foreign-withholding
+            # credit) on PILs. The engine still routes them through the
+            # dividend bucket and applies the credit cap; surface the
+            # ambiguity so the user can override manually before filing.
+            div_flags.append(
+                Flag(
+                    "ibkr.payment_in_lieu",
+                    Severity.WARNING,
+                    "Payment In Lieu Of Dividends: not a true dividend. "
+                    "DBA withholding-tax credit may not apply; verify before "
+                    "relying on any KZ 998 credit produced for this row.",
+                )
+            )
         return Transaction(
             broker=BROKER,
             trade_date=trade_date,
@@ -434,6 +451,7 @@ def _emit_cash_row(
             withholding_country=wh_country,
             dividend_is_net=True,  # IBKR Dividends rows are NET; engine grosses up
             notes=f"IBKR dividend ActionID={action or '-'}",
+            flags=div_flags,
         )
 
     if mapped in {TxType.INTEREST, TxType.INTEREST_OTHER}:

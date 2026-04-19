@@ -277,6 +277,19 @@ def _parse_row(
             "Return of capital: excluded from dividend income. Manually reduce "
             "the position's cost basis if material.",
         ))
+        # T212 CSVs do not break out foreign withholding on RoC rows; the
+        # Total column may already be net of withholding. The pool engine
+        # reduces cost basis by the reported amount, so a net figure will
+        # under-reduce basis and inflate PnL on the next SELL. Surface the
+        # ambiguity loudly so the user can cross-check against the T212
+        # annual tax report before filing.
+        flags.append(Flag(
+            "t212.roc_net_gross_ambiguous",
+            Severity.WARNING,
+            "T212 may report RoC amount net of foreign withholding; "
+            "cost-basis reduction uses the reported (possibly net) value. "
+            "Verify against T212 annual tax report before relying on it.",
+        ))
 
     # Source-country hint for foreign withholding tax (used by credit cap).
     wh_country = country_from_isin(isin) if tx_type is TxType.DIVIDEND_CASH else None

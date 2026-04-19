@@ -208,7 +208,17 @@ def _repair_paired_security_transfers(txns: list[Transaction]) -> None:
                     continue
                 if (in_tx.quantity - out_tx.quantity).copy_abs() > QUANT:
                     continue
-                if abs((in_tx.trade_date - out_tx.trade_date).days) > 7:
+                # Internal custodian rebooking always books the OUT leg first
+                # (shares leave the old sub-custodian) and the IN leg on or
+                # after that date. An IN dated BEFORE the OUT is a different
+                # event (e.g. inbound external transfer followed by outbound
+                # external transfer of a coincidentally equal quantity) and
+                # must NOT be silently paired into a cost-basis-preserving
+                # SPLIT — that would falsify basis for a genuine external
+                # migration. Require in_date >= out_date, within a 7-day
+                # window.
+                delta_days = (in_tx.trade_date - out_tx.trade_date).days
+                if delta_days < 0 or delta_days > 7:
                     continue
                 match = in_tx
                 break
@@ -344,6 +354,17 @@ def _parse_row(
     # this file — emit MIGRATION_IN/OUT with a WARN flag so any later sale
     # fails loudly until the user backfills the basis.
     if raw_type == "Security transfer":
+        if quantity == 0:
+            # A zero-share Security transfer row is ambiguous (no direction,
+            # no effect) and would silently become a no-op MIGRATION_OUT in
+            # the pool. Fail loudly so the user investigates the export.
+            raise ParserError(
+                "Scalable 'Security transfer' row with zero shares is "
+                "ambiguous (no direction can be inferred).",
+                broker=BROKER,
+                source_file=str(path),
+                source_line=lineno,
+            )
         st_type = TxType.MIGRATION_IN if quantity > 0 else TxType.MIGRATION_OUT
         return Transaction(
             broker=BROKER,

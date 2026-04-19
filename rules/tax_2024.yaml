@@ -109,11 +109,15 @@ classification:
   - when: { tx_type: DIVIDEND_CASH }
     bucket: einkuenfte_ueberlassung_27_5
 
-  # Stock dividends (Aktiendividenden) — v1 treats them as zero-cost lots on
-  # the pool side (no immediate income event). Bucket null = no E1kv entry.
+  # Stock dividends (Aktiendividenden) — not currently emitted by any parser.
+  # Kept in the classification table so TaxRules.validate_schema() coverage
+  # check passes; bucket null = no E1kv entry. If a parser ever emits
+  # DIVIDEND_STOCK rows, pool.py would also need an explicit handler — today
+  # the pool's apply() falls through and the shares are neither booked nor
+  # costed. Re-evaluate before adding a parser that produces this type.
   - when: { tx_type: DIVIDEND_STOCK }
     bucket: null
-    note: "v1: handled as zero-cost lot on the pool side"
+    note: "NOT emitted by any current parser; no pool handler — do not use"
 
   # Return of capital / Einlagenrückzahlung (§ 4 Abs. 12 EStG) — NOT taxable
   # as Kapitalertrag. The pool layer automatically reduces the position's

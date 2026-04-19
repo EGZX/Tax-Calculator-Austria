@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from tax_calc_at.model import CutoffViolationError, TxType
+from tax_calc_at.model import CutoffViolationError, ParserError, TxType
 from tax_calc_at.parsers import scalable, trade_republic, trading212
 from tax_calc_at.parsers import ibkr_flex
 
@@ -114,3 +114,57 @@ def test_scalable_paired_security_transfer_drops_basis_missing_warning(tmp_path:
         any(f.code == "scalable.security_transfer_paired" for f in t.flags)
         for t in txs
     )
+
+
+def test_scalable_security_transfer_in_before_out_is_not_paired(tmp_path: Path):
+    """IN dated BEFORE OUT must NOT be silently folded into a SPLIT pair.
+
+    Only OUT-then-IN on the same/subsequent day is a cost-basis-preserving
+    internal custodian rebooking. An IN-then-OUT sequence is a different
+    event (e.g. inbound external transfer followed by outbound external
+    transfer) and must remain a MIGRATION pair so basis is requested.
+    """
+    p = tmp_path / "scalable_xfer_wrong_order.csv"
+    p.write_text(
+        "date;time;status;reference;description;assetType;type;isin;shares;price;amount;fee;tax;currency\n"
+        # IN first, OUT second — must stay MIGRATION_*.
+        "2025-12-05;01:00:00;Executed;IN-1;Microsoft;Security;Security transfer;US5949181045;7;414,55;2901,85;;;EUR\n"
+        "2025-12-06;01:00:00;Executed;OUT-1;Microsoft;Security;Security transfer;US5949181045;-7;410,30;-2872,10;;;EUR\n",
+        encoding="utf-8",
+    )
+    txns, _report = scalable.parse(p)
+    txs = [t for t in txns if t.isin == "US5949181045"]
+    assert len(txs) == 2
+    kinds = sorted(t.tx_type.value for t in txs)
+    assert kinds == [TxType.MIGRATION_IN.value, TxType.MIGRATION_OUT.value]
+    assert all(
+        any(f.code == "scalable.security_transfer" for f in t.flags)
+        for t in txs
+    )
+
+
+def test_scalable_security_transfer_zero_shares_raises(tmp_path: Path):
+    """A Security transfer row with shares=0 is ambiguous and must raise."""
+    p = tmp_path / "scalable_xfer_zero.csv"
+    p.write_text(
+        "date;time;status;reference;description;assetType;type;isin;shares;price;amount;fee;tax;currency\n"
+        "2025-12-05;01:00:00;Executed;BAD-1;Microsoft;Security;Security transfer;US5949181045;0;0;0;;;EUR\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ParserError, match="zero shares"):
+        scalable.parse(p)
+
+
+def test_t212_return_of_capital_carries_net_gross_ambiguity_flag(tmp_path: Path):
+    """T212 RoC row must surface the net/gross ambiguity as a WARNING flag."""
+    p = tmp_path / "t212_roc.csv"
+    p.write_text(
+        "Action,Time,ISIN,Ticker,Name,No. of shares,Price / share,"
+        "Currency (Price / share),Total,Currency (Total),Notes,ID\n"
+        'Dividend (Return of capital),2024-06-01 12:00:00,US0378331005,AAPL,'
+        "Apple,0,0,USD,5.00,EUR,,roc-1\n",
+        encoding="utf-8",
+    )
+    txns, _ = trading212.parse(p)
+    assert len(txns) == 1
+    assert any(f.code == "t212.roc_net_gross_ambiguous" for f in txns[0].flags)

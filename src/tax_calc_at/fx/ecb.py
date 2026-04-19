@@ -60,15 +60,38 @@ def fetch_ecb_series(currency: str) -> dict[date, Decimal]:
     return _parse_ecb_csv(r.text)
 
 
-def ensure_currency_cached(conn: sqlite3.Connection, currency: str) -> None:
-    """If we have no rates for this currency, fetch the full series and cache."""
+def ensure_currency_cached(
+    conn: sqlite3.Connection,
+    currency: str,
+    *,
+    target_date: date | None = None,
+) -> None:
+    """Ensure ECB rates for ``currency`` cover ``target_date``.
+
+    Fetches the full series on first use. If a cache already exists but does
+    not yet cover ``target_date`` (e.g. a user imported 2023 data a year ago
+    and is now importing 2024 data), the series is re-fetched so the 7-day
+    backoff in :func:`lookup_rate` has fresh data to work with. A small
+    grace window of 7 days is tolerated to avoid re-fetching for each
+    weekend/holiday past the latest publication.
+    """
     if currency.upper() == "EUR":
         return
     row = conn.execute(
-        "SELECT 1 FROM fx_rates WHERE currency=? LIMIT 1", (currency.upper(),)
+        "SELECT MAX(rate_date) FROM fx_rates WHERE currency=?",
+        (currency.upper(),),
     ).fetchone()
-    if row:
-        return
+    max_cached = (
+        date.fromisoformat(row[0]) if row and row[0] else None
+    )
+    if max_cached is not None:
+        if target_date is None:
+            return
+        # Allow a 7-day grace window: ECB does not publish on weekends /
+        # holidays, so a target date a few days past the latest cached
+        # rate is still serviceable by the lookup backoff.
+        if target_date <= max_cached + timedelta(days=7):
+            return
     rates = fetch_ecb_series(currency)
     if not rates:
         raise RuntimeError(f"ECB returned no data for {currency}")
@@ -90,7 +113,7 @@ def lookup_rate(conn: sqlite3.Connection, currency: str, on: date) -> Decimal | 
     """
     if currency.upper() == "EUR":
         return Decimal("1")
-    ensure_currency_cached(conn, currency)
+    ensure_currency_cached(conn, currency, target_date=on)
     # ECB publishes 1 EUR = X CCY. We want EUR per 1 CCY, so 1 / rate.
     for delta in range(0, 8):
         d = on - timedelta(days=delta)
