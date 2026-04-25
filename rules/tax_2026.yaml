@@ -1,0 +1,63 @@
+# 2026 — same structure as tax_2025.yaml. Rates unchanged.
+# Kennzahl mapping is best-effort and must be re-verified against official BMF
+# material before filing.
+year: 2026
+rates:
+  kapitalvermoegen_general: 0.275
+  zinsen_geldeinlagen: 0.25
+foreign_withholding:
+  default_creditable_cap: 0.15
+  country_caps:
+    "US": 0.15
+    "CH": 0.15
+    "DE": 0.15
+    "FR": 0.15
+    "IT": 0.15
+    "ES": 0.15
+    "GB": 0.0
+    "IE": 0.0
+    "NL": 0.15
+    "LU": 0.15
+    "BE": 0.15
+    "CA": 0.15
+    "JP": 0.10
+    "AU": 0.15
+    "SE": 0.15
+    "DK": 0.15
+    "FI": 0.15
+    "NO": 0.15
+kennzahlen:
+  einkuenfte_ueberlassung_27_5: { nr: 863, label: "Einkünfte Überlassung Kapital (27,5%) Ausland", credit_bucket: anrechenbare_quellensteuer_27_5 }
+  einkuenfte_realisierte_wertsteigerungen_27_5: { nr: 865, label: "Realisierte Wertsteigerungen (legacy aggregate, fallback)", credit_bucket: anrechenbare_quellensteuer_27_5, tbv: true }
+  einkuenfte_realisierte_wertsteigerungen_27_5_gewinne: { nr: 994, label: "Realisierte Wertsteigerungen Gewinne (27,5%)", credit_bucket: anrechenbare_quellensteuer_27_5 }
+  einkuenfte_realisierte_wertsteigerungen_27_5_verluste: { nr: 892, label: "Realisierte Wertsteigerungen Verluste (27,5%)", credit_bucket: anrechenbare_quellensteuer_27_5 }
+  einkuenfte_derivate_27_5: { nr: 864, label: "Derivate (27,5%) Ausland", credit_bucket: anrechenbare_quellensteuer_27_5 }
+  zinsen_geldeinlagen_25: { nr: 857, label: "Zinsen Geldeinlagen (25%) Ausland", credit_bucket: anrechenbare_quellensteuer_25 }
+  anrechenbare_quellensteuer_27_5: { nr: 998, label: "Anrechenbare Quellensteuer 27,5%" }
+  anrechenbare_quellensteuer_25: { nr: 799, label: "Anrechenbare Quellensteuer 25%" }
+loss_offset:
+  cross_broker: true       # informational only — cross-broker aggregation is always on
+  cross_year: false        # informational only — carry-forward not implemented
+  cross_bucket_within_275: true
+  cross_bucket_within_275_buckets:
+    - einkuenfte_realisierte_wertsteigerungen_27_5_verluste
+    - einkuenfte_ueberlassung_27_5
+classification:
+  - when: { tx_type: SELL, asset_class: [STOCK, ETF, BOND] }
+    bucket: einkuenfte_realisierte_wertsteigerungen_27_5
+  - when: { tx_type: DIVIDEND_CASH }
+    bucket: einkuenfte_ueberlassung_27_5
+  - when: { tx_type: DIVIDEND_STOCK }
+    bucket: null
+  - when: { tx_type: RETURN_OF_CAPITAL }
+    bucket: null
+    note: "RoC reduces cost basis; excess becomes realized gain via pool layer"
+  - when: { tx_type: INTEREST }
+    bucket: zinsen_geldeinlagen_25
+  - when: { tx_type: INTEREST_OTHER }
+    bucket: einkuenfte_ueberlassung_27_5
+    note: "Non-bank interest: bond coupons, broker cash, share-lending, etc."
+  - when: { tx_type: BONUS_SHARE }
+    bucket: null
+  - when: { tx_type: [DEPOSIT_CASH, WITHDRAWAL_CASH, FEE, SPLIT, IGNORED, MIGRATION_IN, MIGRATION_OUT, BUY] }
+    bucket: null
