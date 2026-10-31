@@ -1,15 +1,26 @@
 # Per-broker metadata.
-# `parser` selects an implementation in src/tax_calc_at/parsers/.
-# `steuereinfach_from`: trade_date >= this date is treated as TR-handled. The
-#   default service path emits those rows as TxType.IGNORED with a WARNING
-#   flag (and counts them in rows_rejected) so they appear in the audit tab
-#   but never affect tax math. Pass strict_cutoff=True to the parser to make
-#   it raise CutoffViolationError on the first such row instead.
-# `jurisdiction`: 'foreign' = treated as auslandsdepot (E1kv). 'domestic' is
-#   accepted by the schema but no broker implementation enforces it today \u2014
-#   the field is informational and reserved for future scope.
-# `default_currency`: documentation only \u2014 actual currency is taken from each
-#   transaction row and converted via ECB.
+#
+# `parser`: implementation in src/tax_calc_at/parsers/.
+#
+# `credit_institution` (required): is cash held at this broker a deposit at a
+#   credit institution (Kreditinstitut, § 1 BWG / CRR; EStR Rz 7705)? Decides
+#   25 % (E1kv KZ 861) vs 27,5 % (KZ 863) for cash interest and cashback
+#   (§ 27a Abs 1 Z 1, EStR Rz 6134, Rz 6223) and KZ 865 vs 994 for FX gains on
+#   cash balances (E1kv Anm 8).
+#
+# `steuereinfach_from`: rows with trade_date >= this date are handled by the
+#   broker's Austrian KESt withholding and are excluded (IGNORED rows with a
+#   WARNING; strict_cutoff=True raises instead). For brokers that migrated
+#   existing customers individually the date is ACCOUNT-SPECIFIC: put your
+#   own date into rules/local/brokers.yaml, e.g.
+#     brokers:
+#       trade_republic: {steuereinfach_from: 2025-05-02}
+#
+# Personal facts belong in the git-ignored rules/local/ directory; files there
+# extend the public files of the same name.
+#
+# `jurisdiction`: 'foreign' = Auslandsdepot (E1kv "ohne KESt-Abzug").
+# `default_currency`: documentation only; currencies come from each row.
 
 brokers:
   ibkr:
@@ -17,22 +28,39 @@ brokers:
     display_name: Interactive Brokers
     jurisdiction: foreign
     default_currency: USD
+    # Interactive Brokers Ireland Ltd is a MiFID investment firm, not a
+    # credit institution (EStR Rz 6223: deposits at investment firms -> 27,5 %).
+    credit_institution: false
 
   scalable_capital:
     parser: scalable
     display_name: Scalable Capital
     jurisdiction: foreign
     default_currency: EUR
+    # Cash interest was paid by the partner bank Baader Bank AG ("KKT-
+    # Abschluss") and, since 10 Sep 2025, by Scalable Capital Bank GmbH (ECB
+    # licence, CRR credit institution). Cash parked in money-market funds is
+    # NOT a deposit — such holdings appear as fund transactions instead.
+    # Scalable is steuereinfach in Austria for NEW customers since 2026-10-08;
+    # existing customers migrate later: set steuereinfach_from accordingly.
+    credit_institution: true
 
   trade_republic:
     parser: trade_republic
     display_name: Trade Republic
     jurisdiction: foreign
     default_currency: EUR
-    steuereinfach_from: 2025-04-29  # TR became steuereinfach in AT on this date
+    # Trade Republic Bank GmbH: full banking licence (ECB) since 2023-12-06.
+    credit_institution: true
+    # Steuereinfach in Austria since 2025-04-24 (KESt on all income incl.
+    # cash interest and Saveback). Existing customers switched individually
+    # on their migration date — override in rules/local/brokers.yaml.
+    steuereinfach_from: 2025-04-24
 
   trading212:
     parser: trading212
     display_name: Trading 212
     jurisdiction: foreign
     default_currency: EUR
+    # Trading 212 Markets Ltd (CySEC) is an investment firm, not a bank.
+    credit_institution: false

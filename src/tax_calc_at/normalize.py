@@ -6,9 +6,8 @@ import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
-from dateutil import parser as _dateparser
-
 ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DMY_DATE_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
 
 
@@ -47,21 +46,32 @@ def parse_decimal(value: str | int | float | Decimal | None, *, decimal_sep: str
 
 
 def parse_date(value: str) -> date:
-    """Parse an ISO date or common European date string into :class:`date`."""
+    """Parse an unambiguous date string.
+
+    Accepted: ISO ``YYYY-MM-DD``, ISO 8601 date-times (``YYYY-MM-DD HH:MM:SS``,
+    ``…T…``, fractional seconds, ``Z`` / offsets — the date part is returned
+    as written) and the Austrian/German ``DD.MM.YYYY``. Anything else raises:
+    guessing day/month order (``01.02.2024`` vs ``02/01/2024``) is how dates
+    silently go wrong.
+    """
     if not value:
         raise ValueError("empty date")
     s = value.strip().strip('"')
     if ISO_DATE_RE.match(s):
         return date.fromisoformat(s)
-    # fallback: dateutil (handles 'YYYY-MM-DD HH:MM:SS', 'DD.MM.YYYY', ISO-8601 with TZ)
-    dt = _dateparser.parse(s)
-    return dt.date()
+    m = DMY_DATE_RE.match(s)
+    if m:
+        return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    return parse_datetime(s).date()
 
 
 def parse_datetime(value: str) -> datetime:
-    """Parse an ISO 8601 datetime (with or without timezone)."""
+    """Parse an ISO 8601 date-time (with or without timezone)."""
     s = value.strip().strip('"')
-    return _dateparser.parse(s)
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError as e:
+        raise ValueError(f"Unsupported date/time format: {value!r}") from e
 
 
 def is_valid_isin(isin: str) -> bool:

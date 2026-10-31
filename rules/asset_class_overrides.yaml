@@ -1,3 +1,6 @@
+# Public template. Put YOUR entries into rules/local/asset_class_overrides.yaml
+# (git-ignored); both files are combined.
+#
 # Per-ISIN asset-class override.
 #
 # Many broker exports (Trading 212 especially) do not emit an asset-class

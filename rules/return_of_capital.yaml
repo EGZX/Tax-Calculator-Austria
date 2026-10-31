@@ -1,0 +1,26 @@
+# Public template. Put YOUR entries into rules/local/return_of_capital.yaml
+# (git-ignored); both files are combined.
+#
+# Distributions proven to be an Einlagenrückzahlung (§ 4 Abs 12 EStG,
+# KapMaßVO § 2 Abs 2 Z 1): not income; they reduce the position's cost basis
+# and any excess over the basis is a realized gain.
+#
+# A broker's "return of capital" label (e.g. US Form 1099 box 3, Trading 212
+# "Dividend (Return of capital)") is NOT proof for Austria: the foreign
+# company's accounts / resolutions must show repaid contributed capital
+# (Einlagenrückzahlungserlass 5.5). Without an entry here such distributions
+# are taxed as dividends.
+#
+# Fields: broker, isin (required), date_from / date_to (inclusive),
+# reference_regex (Python regex on the broker reference), evidence (required).
+#
+# Example:
+#   return_of_capital:
+#     - broker: scalable_capital
+#       isin: CNE100000296
+#       date_from: 2025-09-15
+#       date_to: 2025-09-15
+#       reference_regex: '^WWEK 50958290$'
+#       evidence: "Issuer resolution of 2025-06-30, capital reserve repayment"
+
+return_of_capital: []

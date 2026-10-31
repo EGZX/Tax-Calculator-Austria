@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -35,6 +36,18 @@ def test_parse_date_iso():
 
 def test_parse_date_with_time():
     assert parse_date("2024-12-30 17:20:29").day == 30
+    assert parse_date("2023-03-15T10:00:00.123456Z").day == 15
+
+
+def test_parse_date_european_is_day_first():
+    """Regression: dateutil read 01.02.2024 as 2 January."""
+    assert parse_date("01.02.2024") == date(2024, 2, 1)
+
+
+@pytest.mark.parametrize("ambiguous", ["5/6/2024", "2024/06/05", "June 5 2024"])
+def test_parse_date_rejects_ambiguous_formats(ambiguous):
+    with pytest.raises(ValueError):
+        parse_date(ambiguous)
 
 
 def test_isin_valid():

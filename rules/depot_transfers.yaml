@@ -1,0 +1,37 @@
+# Public template. Put YOUR entries into rules/local/depot_transfers.yaml
+# (git-ignored); both files are combined.
+#
+# Depot transfers (§ 27 Abs 6 Z 2 EStG). Moving securities out of a FOREIGN
+# depot — also to another depot of your own — is a deemed sale at market
+# value unless you notified the Finanzamt within ONE month (FinanzOnline:
+# "Weitere Services → Depotübertragung", EStR Rz 6166a). Without an entry
+# here, an outgoing transfer row blocks the report.
+#
+# This includes custody changes initiated by the broker, e.g. Scalable
+# Capital moving all depots from Baader Bank to Scalable Capital Bank on
+# 5/6 Dec 2025 (foreign → foreign, notifiable).
+#
+# Fields:
+#   id         unique free text (e.g. your FinanzOnline reference number)
+#   notified   true  = notified in time: neutral, cost basis moves with the
+#                      shares (out → in legs paired per ISIN by quantity)
+#              false = deemed sale at market value; the receiving depot
+#                      takes over the market value as cost basis
+#   out / in   {broker, date_from, date_to} of the transfer rows; omit a side
+#              that is not imported (e.g. an Austrian bank)
+#   isins      list of ISINs, or ["*"] for all transfer rows in the windows
+#   cost_basis_eur    {ISIN: EUR} — notified transfers without `out` side:
+#                     the Anschaffungskosten reported to the Finanzamt
+#   market_value_eur  {ISIN: EUR} — not notified; defaults to the transfer
+#                     row's own valuation price × quantity where present
+#
+# Example:
+#   transfers:
+#     - id: scalable-baader-to-scalable-bank-2025-12
+#       notified: true
+#       out: {broker: scalable_capital, date_from: 2025-12-05, date_to: 2025-12-05}
+#       in:  {broker: scalable_capital, date_from: 2025-12-06, date_to: 2025-12-06}
+#       isins: ["*"]
+#       note: "FinanzOnline Depotübertragung submitted 2025-12-20"
+
+transfers: []

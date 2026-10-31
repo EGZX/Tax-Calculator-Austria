@@ -1,0 +1,51 @@
+# Public template. Put YOUR entries into rules/local/corporate_actions.yaml
+# (git-ignored); both files are combined.
+#
+# Treatment of corporate-action bookings the parser cannot resolve on its own
+# (shares of a security appearing that is not held yet, or a position
+# disappearing). Brokers book these under their home-country tax law; this
+# file states the AUSTRIAN treatment.
+#
+# treatment: split
+#   Tax-neutral: share split (also a US "split effected in the form of a
+#   stock dividend") or capital increase from company funds of a company
+#   comparable to an Austrian corporation (KapMaßVO §§ 4 Abs 1, 6; EStR
+#   Rz 306, 308 — keep the evidence). Cost basis unchanged.
+# treatment: spinoff
+#   Tax-neutral Abspaltung (KapMaßVO § 4 Abs 2): `basis_fraction` of the
+#   parent's cost basis moves to the new shares, in the ratio of the market
+#   values (Verkehrswerte) of parent and spun-off shares; if no market values
+#   exist, by share count. Fields: parent_isin, basis_fraction (0 ≤ f < 1).
+# treatment: taxable_distribution
+#   Sachausschüttung / stock dividend / bonus shares out of profits, taxed
+#   as a dividend at market value (EStR Rz 307; BFG RV/5100407/2024).
+#   Fields: market_value_eur (total EUR value at receipt) — income (KZ 863)
+#   and cost basis of the new shares; optional quantity = number of shares
+#   of the booking that are taxable (the rest is declared a tax-neutral
+#   split), for bookings that combine both, e.g. BYD 2025 (12:10 capital
+#   reserve + 8:10 out of profits, booked as one +20:10 increase).
+# treatment: exchange
+#   Tax-neutral exchange (ISIN change, comparable merger; KapMaßVO §§ 3, 8):
+#   the basis of `from_isin` (outgoing leg on the same date) moves to `isin`.
+#
+# Each entry must match exactly one incoming corporate-action row
+# (broker, date, isin).
+#
+# Example:
+#   corporate_actions:
+#     - broker: scalable_capital
+#       date: 2023-01-04
+#       isin: US36266G1076          # GE HealthCare
+#       treatment: spinoff
+#       parent_isin: US3696043013   # General Electric
+#       basis_fraction: "0.1520"    # market values on the first trading day
+#       note: "GE HealthCare spin-off 1:3"
+#     - broker: ibkr
+#       date: 2025-06-10
+#       isin: CNE100000296          # BYD (H)
+#       treatment: taxable_distribution
+#       quantity: "8"               # 8:10 bonus shares out of profits, of 20 booked
+#       market_value_eur: "116.03"  # 8 x HKD 130.10 at the ECB rate of the day
+#       note: "12:10 from capital reserve is neutral; 8:10 from profits taxable"
+
+corporate_actions: []

@@ -10,20 +10,26 @@ Tables (all created on first connect):
 Re-importing the same file is idempotent: matching dedup keys with the same
 content_hash are silently kept; matching keys with a different content_hash
 raise :class:`DuplicateMismatchError`.
+
+The ``meta`` table records :data:`SCHEMA_VERSION`. It is bumped whenever the
+meaning of persisted rows changes (parser semantics, new columns). A store
+written by another version raises :class:`DatabaseVersionError` instead of
+silently mixing old and new interpretations; re-import from ``data/raw``.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
+from collections.abc import Iterable
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .model import (
     AssetClass,
+    DatabaseVersionError,
     DuplicateMismatchError,
     Flag,
     FxSource,
@@ -32,7 +38,18 @@ from .model import (
     TxType,
 )
 
+# v2: corrected parser semantics (IBKR/TR gross dividends, signed WHT,
+# corporate-action legs, bonus income types) + link/counter-leg columns.
+# v3: share increases without a split type (Scalable add-only bookings,
+# IBKR SD) carry the corporate_action.unclassified blocker flag.
+SCHEMA_VERSION = 3
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS import_batches (
     id            TEXT PRIMARY KEY,
     broker        TEXT NOT NULL,
@@ -72,6 +89,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     fx_rate_source       TEXT NOT NULL,
     withholding_country  TEXT,
     dividend_is_net      TEXT,
+    link_id              TEXT,
+    counter_currency     TEXT,
+    counter_amount       TEXT,
     raw_ref              TEXT,
     source_file          TEXT NOT NULL,
     source_line          INTEGER NOT NULL,
@@ -96,7 +116,7 @@ CREATE TABLE IF NOT EXISTS pool_snapshots (
 CREATE TABLE IF NOT EXISTS fx_rates (
     currency TEXT NOT NULL,
     rate_date TEXT NOT NULL,
-    rate     TEXT NOT NULL,             -- EUR per 1 unit of `currency`
+    rate     TEXT NOT NULL,             -- ECB quote: units of `currency` per 1 EUR
     source   TEXT NOT NULL,             -- 'ECB'
     fetched_at TEXT NOT NULL,
     PRIMARY KEY (currency, rate_date)
@@ -108,15 +128,46 @@ def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys = ON;")
+    # Check the version before touching the schema: an old store must be
+    # rejected as a whole, not partially migrated.
+    _check_schema_version(conn, db_path)
     conn.executescript(SCHEMA)
-    # Additive migration: add columns introduced after the initial schema so
-    # existing DBs keep working without manual intervention.
-    cur = conn.execute("PRAGMA table_info(transactions)")
-    cols = {r[1] for r in cur.fetchall()}
-    if "dividend_is_net" not in cols:
-        conn.execute("ALTER TABLE transactions ADD COLUMN dividend_is_net TEXT")
+    if conn.execute("SELECT 1 FROM meta WHERE key='schema_version'").fetchone() is None:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
         conn.commit()
     return conn
+
+
+def _check_schema_version(conn: sqlite3.Connection, db_path: Path) -> None:
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "transactions" not in tables:
+        return  # fresh store
+    row = (
+        conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if "meta" in tables
+        else None
+    )
+    if row is None:
+        has_rows = conn.execute("SELECT 1 FROM transactions LIMIT 1").fetchone()
+        if has_rows is not None:
+            raise DatabaseVersionError(
+                f"{db_path} holds transactions written before schema versioning "
+                f"(parser semantics changed since). Delete the database and "
+                f"re-import the raw exports (archived under data/raw/)."
+            )
+        conn.close()
+        raise DatabaseVersionError(
+            f"{db_path} has an empty pre-versioning schema; delete it and re-import."
+        )
+    if int(row[0]) != SCHEMA_VERSION:
+        raise DatabaseVersionError(
+            f"{db_path} was written with schema v{row[0]}, this version expects "
+            f"v{SCHEMA_VERSION}. Delete the database and re-import the raw "
+            f"exports (archived under data/raw/)."
+        )
 
 
 # ---------------------------------------------------------------- transactions
@@ -135,7 +186,10 @@ def _flags_to_json(flags: list[Flag]) -> str:
 
 
 def _flags_from_json(s: str) -> list[Flag]:
-    return [Flag(code=d["code"], severity=Severity(d["severity"]), message=d["message"]) for d in json.loads(s)]
+    return [
+        Flag(code=d["code"], severity=Severity(d["severity"]), message=d["message"])
+        for d in json.loads(s)
+    ]
 
 
 def upsert_transactions(
@@ -168,9 +222,11 @@ def upsert_transactions(
                     quantity, price_native, currency_native, gross_native,
                     fee_native, tax_withheld_native,
                     amount_eur, fee_eur, tax_withheld_eur, fx_rate_used, fx_rate_source,
-                    withholding_country, dividend_is_net, raw_ref, source_file, source_line,
+                    withholding_country, dividend_is_net, link_id, counter_currency,
+                    counter_amount, raw_ref, source_file, source_line,
                     notes, flags_json, import_batch_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     key,
                     chash,
@@ -197,6 +253,9 @@ def upsert_transactions(
                     tx.fx_rate_source.value,
                     tx.withholding_country,
                     None if tx.dividend_is_net is None else ("1" if tx.dividend_is_net else "0"),
+                    tx.link_id,
+                    tx.counter_currency,
+                    _dec_to_str(tx.counter_amount),
                     tx.raw_ref,
                     tx.source_file,
                     tx.source_line,
@@ -211,7 +270,8 @@ def upsert_transactions(
             if existing_hash != chash:
                 raise DuplicateMismatchError(
                     f"Dedup key collision with different content for tx in "
-                    f"{tx.source_file}:{tx.source_line} (existing: {existing_file}:{existing_line}). "
+                    f"{tx.source_file}:{tx.source_line} "
+                    f"(existing: {existing_file}:{existing_line}). "
                     f"A previously imported row was modified. Either revert the source file, "
                     f"or delete the old import batch first."
                 )
@@ -274,7 +334,7 @@ def fetch_transactions(
     cols = [c[0] for c in cur.description]
     out: list[Transaction] = []
     for row in cur.fetchall():
-        d = dict(zip(cols, row))
+        d = dict(zip(cols, row, strict=False))
         tx = Transaction(
             broker=d["broker"],
             trade_date=date.fromisoformat(d["trade_date"]),
@@ -313,6 +373,9 @@ def fetch_transactions(
                 if d.get("dividend_is_net") is None
                 else (d["dividend_is_net"] == "1")
             ),
+            link_id=d["link_id"],
+            counter_currency=d["counter_currency"],
+            counter_amount=_str_to_dec(d["counter_amount"]),
             notes=d["notes"],
             flags=_flags_from_json(d["flags_json"]),
             import_batch_id=d["import_batch_id"],
@@ -339,7 +402,8 @@ def put_fx_rates(
     fetched_at: str,
 ) -> None:
     conn.executemany(
-        "INSERT OR REPLACE INTO fx_rates (currency, rate_date, rate, source, fetched_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO fx_rates (currency, rate_date, rate, source, fetched_at) "
+        "VALUES (?, ?, ?, ?, ?)",
         [(currency, d.isoformat(), format(r, "f"), source, fetched_at) for d, r in rates.items()],
     )
     conn.commit()

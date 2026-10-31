@@ -215,3 +215,5 @@ __marimo__/
 
 # user files
 /exports
+# Personal tax facts (declarations, overrides, broker cutoffs) — never commit
+/rules/local/

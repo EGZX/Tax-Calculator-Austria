@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import tempfile
 import shutil
+import tempfile
 import traceback
 from datetime import date
 from pathlib import Path
@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from tax_calc_at.engine.rules import load_brokers, load_tax_rules
+from tax_calc_at.export import WorksheetBundle
 from tax_calc_at.model import Severity, TaxCalcError
 from tax_calc_at.service import (
     DEFAULT_DB,
@@ -50,11 +51,16 @@ with tab_import:
 
     cols = st.columns(2)
     broker_key = cols[0].selectbox(
-        "Broker", options=list(brokers.brokers.keys()), format_func=lambda k: brokers.get(k).display_name
+        "Broker",
+        options=list(brokers.brokers.keys()),
+        format_func=lambda k: brokers.get(k).display_name,
     )
     cutoff = brokers.get(broker_key).steuereinfach_from
     if cutoff:
-        cols[1].info(f"Hard cutoff: trade_date >= {cutoff} will be REJECTED.")
+        cols[1].info(
+            f"Steuereinfach from {cutoff}: rows on/after this date are excluded "
+            "(taxed by the broker)."
+        )
 
     uploaded = st.file_uploader(
         "Choose a CSV export (multiple allowed)",
@@ -104,7 +110,7 @@ with tab_import:
             conn,
         )
         conn.close()
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
     except Exception as e:
         st.warning(f"No batch history yet: {e}")
 
@@ -179,7 +185,7 @@ with tab_tx:
     if df.empty:
         st.info("No transactions match the current filter.")
     else:
-        st.dataframe(df.style.apply(_color, axis=1), use_container_width=True, hide_index=True)
+        st.dataframe(df.style.apply(_color, axis=1), width="stretch", hide_index=True)
         st.caption(f"{len(df)} rows")
 
 
@@ -223,9 +229,9 @@ with tab_e1kv:
             st.dataframe(
                 pd.DataFrame(
                     rep.health.excluded_isins,
-                    columns=["broker", "isin", "error"],
+                    columns=["broker", "isin", "error", "date"],
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -276,13 +282,21 @@ with tab_e1kv:
                 }
             )
         if summary_rows:
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
         else:
             st.info("No taxable items for this year (yet).")
 
         # Uncreditable foreign withholding — above the DBA cap, not creditable
         # against Austrian KESt, but potentially reclaimable from the source
         # state. Surface it so the user knows to chase a refund.
+        if rep.credit_lost_to_loss_offset:
+            st.info(
+                "Quellensteuer, die durch den Verlustausgleich nicht mehr anrechenbar "
+                "ist (EStR Rz 7752h), ist in den Anrechnungs-Kennzahlen bereits "
+                "abgezogen: "
+                + ", ".join(f"{cb}: {amt:.2f} EUR"
+                            for cb, amt in rep.credit_lost_to_loss_offset.items())
+            )
         if rep.uncreditable_withholding:
             st.warning(
                 "Nicht anrechenbare Quellensteuer (Überschuss über DBA-Höchstsatz). "
@@ -298,7 +312,7 @@ with tab_e1kv:
                 for cb, amt in rep.uncreditable_withholding.items()
             ]
             st.dataframe(
-                pd.DataFrame(excess_rows), use_container_width=True, hide_index=True
+                pd.DataFrame(excess_rows), width="stretch", hide_index=True
             )
 
     if rep.loss_offset_note:
@@ -322,8 +336,9 @@ with tab_e1kv:
             st.error(f"Export fehlgeschlagen: {e}")
         except Exception:
             st.error(f"```\n{traceback.format_exc()}\n```")
-    bundle = st.session_state.get("wsheet_bundle")
-    if bundle is not None:
+    stored = st.session_state.get("wsheet_bundle")
+    if isinstance(stored, WorksheetBundle):
+        bundle = stored
         export_cols[1].download_button(
             label=f"⬇ Download {bundle.filename} ({len(bundle.content)//1024} KB)",
             data=bundle.content,
@@ -332,23 +347,12 @@ with tab_e1kv:
             key="dl_wsheet",
         )
 
-    # ---- Uncertain tax treatment ---------------------------------------
-    # Surface rows that were included (or excluded) under ambiguous broker
-    # data so the user can manually verify before filing.
-    _UNCERTAIN_FLAG_CODES = {
-        "t212.missing_withholding_detail",
-        "t212.return_of_capital",
-        "scalable.distribution_override_roc",
-        "scalable.corporate_action",
-        "scalable.security_transfer",
-        "bonus_share_non_broker_source",
-        "split_review",
-        "t212.free_share_promo",
-    }
+    # ---- Rows needing review: every WARNING/ERROR flag raised by parsers or
+    # declarations, so ambiguous broker data can never be silently accepted.
     uncertain_rows = []
     for t in year_txns:
         for f in t.flags:
-            if f.code in _UNCERTAIN_FLAG_CODES:
+            if f.severity in (Severity.WARNING, Severity.ERROR):
                 uncertain_rows.append(
                     {
                         "date": t.trade_date.isoformat(),
@@ -361,19 +365,14 @@ with tab_e1kv:
                         "message": f.message,
                     }
                 )
-                break  # one row per tx in the warning table
     if uncertain_rows:
         st.divider()
-        st.subheader("⚠ Unsichere steuerliche Behandlung")
+        st.subheader("⚠ Zu prüfende Zeilen")
         st.caption(
-            f"{len(uncertain_rows)} Zeile(n) wurden trotz Mehrdeutigkeit "
-            "automatisch klassifiziert oder ausgeschlossen. Bitte vor Abgabe "
-            "manuell prüfen (z.B. Trading-212-Steuerreport zu Quellensteuer / "
-            "Einlagenrückzahlung)."
+            f"{len(uncertain_rows)} Hinweis(e) aus Parsern/Deklarationen. Bitte vor "
+            "Abgabe prüfen (Broker-Steuerreport, Kapitalmaßnahmen, Depotüberträge)."
         )
-        st.dataframe(
-            pd.DataFrame(uncertain_rows), use_container_width=True, hide_index=True
-        )
+        st.dataframe(pd.DataFrame(uncertain_rows), width="stretch", hide_index=True)
 
     if not show_numbers:
         # Per-bucket breakdown is also gated — same reasoning as the summary
@@ -382,8 +381,9 @@ with tab_e1kv:
     else:
         st.divider()
         st.subheader("Per-bucket breakdown")
-        for bname, br in sorted(rep.buckets.items(), key=lambda x: x[1].kennzahl.nr):
-            with st.expander(f"KZ {br.kennzahl.nr} — {br.kennzahl.label}  →  {br.total_eur:.2f} EUR"):
+        for br in sorted(rep.buckets.values(), key=lambda b: b.kennzahl.nr):
+            title = f"KZ {br.kennzahl.nr} — {br.kennzahl.label}  →  {br.total_eur:.2f} EUR"
+            with st.expander(title):
                 df = pd.DataFrame(
                     [
                         {
@@ -397,7 +397,7 @@ with tab_e1kv:
                         for c in br.contributions
                     ]
                 )
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.dataframe(df, width="stretch", hide_index=True)
 
 
 # ----------------------------------------------------------------- AUDIT TAB
@@ -425,6 +425,6 @@ with tab_audit:
                     for isin, s in sorted(pools.by_isin.items())
                 ]
             )
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
             st.caption("Event log (last 200)")
             st.code("\n".join(pools.log.events[-200:]) or "(no events)")

@@ -1,152 +1,186 @@
-# Austrian capital-income tax rules — tax year 2024.
+# Austrian capital-income rules for tax year 2024 — Beilage E 1kv,
+# column "Ausländische Kapitaleinkünfte" (foreign depot, no Austrian KESt).
 #
-# Kennzahl mapping is best-effort and provided without warranty. Validate all
-# Kennzahlen against the official BMF forms/notes for your filing period.
+# Provided without warranty; verify against the official form before filing.
 #
-# Sources consulted:
-#   - BMF E1kv form (2024 edition) + Erläuterungen
-#   - Linde DB Dok. 186660 (Erläuterungen E1kv)
-#   - kestaustria.at, broker-test.at, onlinebrokertest.at (informational only)
+# Kennzahlen verified against the official BMF form and its built-in
+# Erläuterungen (Anm.):
+#   https://formulare.bmf.gv.at/service/formulare/inter-Steuern/pdfs/2024/E1kv.pdf
+#   (version 02.10.2024). Numbers are identical on the 2023 and 2025 forms.
+#
+# Reporting principle (Anm 19, EStR Rz 7752h): gains and losses are entered
+# separately and gross; the Finanzamt performs the Verlustausgleich over all
+# section 1.3 Kennzahlen. The engine therefore never nets reported figures —
+# it only reduces the creditable foreign tax for income consumed by the loss
+# offset (Anm 22, EStR Rz 7752h).
 
 year: 2024
+form_source: "BMF Beilage E 1kv 2024 (Version 02.10.2024)"
 
-rates:  # Informational only — the engine does not compute the final tax owed
-  # (FinanzOnline does that from the Kennzahl figures). These values document
-  # the applicable special rates so reviewers can sanity-check the basket
-  # split below.  # § 27a Abs. 1 EStG — special tax rate for capital income
-  kapitalvermoegen_general: 0.275   # Aktien, Fonds, ETFs, Dividenden, Kursgewinne
-  zinsen_geldeinlagen: 0.25         # Bankzinsen (Sparbuch, Girokonto, Geldmarkt)
-
-# Foreign withholding tax credit
-foreign_withholding:
-  # Default cap per DBA (most treaties allow 15% credit on dividends).
-  default_creditable_cap: 0.15
-  # Per-country caps (ISO-2). Values are the DBA-anrechenbar ceiling, NOT the
-  # broker-withheld rate. Excess (e.g. the 20 % refundable part of the Swiss
-  # Verrechnungssteuer) must be reclaimed from the foreign authority — not
-  # credited against Austrian KESt. Cross-check with the current BMF
-  # Durchführungserlass before relying in filing.
-  country_caps:
-    "US": 0.15   # DBA AT-US, Art 10: 15 % on portfolio dividends
-    "CH": 0.15   # DBA AT-CH, Art 10; 20 % refundable via Form 85
-    "DE": 0.15   # DBA AT-DE, Art 10
-    "FR": 0.15   # DBA AT-FR, Art 10
-    "IT": 0.15   # DBA AT-IT, Art 10
-    "ES": 0.15   # DBA AT-ES, Art 10
-    "GB": 0.0    # DBA AT-UK: UK does not levy WHT on dividends
-    "IE": 0.0    # Ireland: no WHT on outbound dividends (subject to conditions)
-    "NL": 0.15   # DBA AT-NL, Art 10
-    "LU": 0.15   # DBA AT-LU, Art 10
-    "BE": 0.15   # DBA AT-BE, Art 10
-    "CA": 0.15   # DBA AT-CA, Art 10
-    "JP": 0.10   # DBA AT-JP, Art 10: 10 % cap
-    "AU": 0.15   # DBA AT-AU, Art 10
-    "SE": 0.15   # DBA AT-SE, Art 10
-    "DK": 0.15   # DBA AT-DK, Art 10
-    "FI": 0.15   # DBA AT-FI, Art 10
-    "NO": 0.15   # DBA AT-NO, Art 10
-
-# Mapping bucket -> Kennzahl number on Beilage E 1kv 2024.
-# `credit_bucket` (optional) names the bucket that absorbs creditable foreign
-# withholding tax for income classified into THIS bucket.
 kennzahlen:
-  # Special-rate (27.5%) foreign income
-  einkuenfte_ueberlassung_27_5:
+  # --- 1.2 special rate, NO loss offset ----------------------------------
+  zinsen_kreditinstitute_25:
+    nr: 861
+    label: "Zinsen aus Geldeinlagen und nicht verbrieften sonstigen Forderungen bei Kreditinstituten (25 %)"
+    kind: income
+    rate: 0.25
+    loss_offset: false   # § 27 Abs 8 Z 1 EStG
+    credit_bucket: anrechenbare_qst_25
+
+  # --- 1.3 special rate, loss offset allowed -----------------------------
+  ueberlassung_27_5:
     nr: 863
-    label: "Einkünfte aus der Überlassung von Kapital (27,5 %), ausländisch"
-    credit_bucket: anrechenbare_quellensteuer_27_5
-  einkuenfte_realisierte_wertsteigerungen_27_5:
-    nr: 865
-    label: "Realisierte Wertsteigerungen (legacy aggregate, fallback)"
-    credit_bucket: anrechenbare_quellensteuer_27_5
-    tbv: true
-  einkuenfte_realisierte_wertsteigerungen_27_5_gewinne:
+    label: "Einkünfte aus der Überlassung von Kapital (27,5 %)"
+    kind: income
+    rate: 0.275
+    loss_offset: true
+    credit_bucket: anrechenbare_qst_27_5
+  realisiert_ueberschuesse_27_5:
     nr: 994
-    label: "Realisierte Wertsteigerungen Gewinne (27,5 %)"
-    credit_bucket: anrechenbare_quellensteuer_27_5
-  einkuenfte_realisierte_wertsteigerungen_27_5_verluste:
+    label: "Realisierte Wertsteigerungen – Überschüsse 27,5 %"
+    kind: gain
+    rate: 0.275
+    loss_offset: true
+    loss_bucket: realisiert_verluste
+  realisiert_ueberschuesse_25:
+    # Anm 8: 25 % gains, in particular FX gains on deposits (Fremdwährungs-
+    # guthaben) at a credit institution.
+    nr: 865
+    label: "Realisierte Wertsteigerungen – Überschüsse 25 %"
+    kind: gain
+    rate: 0.25
+    loss_offset: true
+    loss_bucket: realisiert_verluste
+  realisiert_verluste:
     nr: 892
-    label: "Realisierte Wertsteigerungen Verluste (27,5 %)"
-    credit_bucket: anrechenbare_quellensteuer_27_5
-  einkuenfte_derivate_27_5:
-    nr: 864
-    label: "Einkünfte aus Derivaten (27,5 %), ausländisch"
-    credit_bucket: anrechenbare_quellensteuer_27_5
-  # 25% bucket (bank interest, savings)
-  zinsen_geldeinlagen_25:
-    nr: 857
-    label: "Zinsen aus Geldeinlagen bei Kreditinstituten (25 %), ausländisch"
-    credit_bucket: anrechenbare_quellensteuer_25
-  # Foreign withholding tax that may be credited
-  anrechenbare_quellensteuer_27_5:
+    label: "Realisierte Wertsteigerungen – Verluste"
+    kind: loss
+    loss_offset: true
+  derivate_ueberschuesse_27_5:
+    nr: 995
+    label: "Verbriefte Derivate – Überschüsse 27,5 %"
+    kind: gain
+    rate: 0.275
+    loss_offset: true
+    loss_bucket: derivate_verluste
+  derivate_verluste:
+    nr: 896
+    label: "Verbriefte Derivate – Verluste"
+    kind: loss
+    loss_offset: true
+  fonds_ausschuettungen_27_5:
+    nr: 898
+    label: "Investmentfonds – Ausschüttungen 27,5 %"
+    kind: income
+    rate: 0.275
+    loss_offset: true
+    credit_bucket: anrechenbare_qst_27_5
+  fonds_age_27_5:
+    # Not computed (requires OeKB Meldefonds data); declared so that the
+    # report can name it. ETF positions block the report instead.
+    nr: 937
+    label: "Investmentfonds – ausschüttungsgleiche Erträge 27,5 %"
+    kind: income
+    rate: 0.275
+    loss_offset: true
+    credit_bucket: anrechenbare_qst_27_5
+
+  # --- creditable foreign tax --------------------------------------------
+  anrechenbare_qst_27_5:
     nr: 998
-    label: "Anrechenbare ausländische (Quellen-)Steuer auf 27,5 %-Einkünfte"
-  anrechenbare_quellensteuer_25:
-    nr: 799
-    label: "Anrechenbare ausländische (Quellen-)Steuer auf 25 %-Einkünfte"
+    label: "Anzurechnende ausländische (Quellen)Steuer auf 27,5 %-Einkünfte"
+    kind: credit
+  anrechenbare_qst_25:
+    nr: 901
+    label: "Anzurechnende ausländische (Quellen)Steuer auf 25 %-Einkünfte"
+    kind: credit
 
-# Loss-offset rules for private investors (§ 27 Abs. 8 EStG).
-# NOTE: cross_broker / cross_year are currently INFORMATIONAL only — they
-# control the report’s loss-offset note text but not aggregation. Cross-broker
-# aggregation is always performed; carry-forward (cross_year) is not yet
-# implemented (private investors usually cannot carry losses forward anyway).
-loss_offset:
-  cross_broker: true
-  cross_year: false
-  # Losses from realized gains (865) may offset dividends (863) only within
-  # the 27.5% basket; never against 25% interest.
-  cross_bucket_within_275: true
-  cross_bucket_within_275_buckets:
-    - einkuenfte_realisierte_wertsteigerungen_27_5_verluste
-    - einkuenfte_ueberlassung_27_5
+# Foreign withholding tax that may be credited (Anm 22): at most the DBA
+# residual rate × GROSS income, at most the Austrian tax on that income, and
+# only to the extent the income is not consumed by the loss offset. Excess is
+# refundable abroad only and must not be entered.
+foreign_withholding:
+  dividend_caps:            # DBA Art 10, portfolio holding, individual
+    "AU": 0.15  # BGBl 480/1988 Art 10(2)
+    "BE": 0.15  # BGBl 415/1973 Art 10(2)
+    "BR": 0.15  # BGBl 431/1976 Art 10(2); Art 23(5) deemed credit NOT applied
+    "CA": 0.15  # BGBl 77/1981 idF BGBl III 2/2001 Art 10(2)(b)
+    "CH": 0.15  # BGBl 64/1975 idF BGBl III 204/2001 Art 10(2); 20 % refundable
+    "CN": 0.10  # BGBl 679/1992 Art 10(2)(b)
+    "CZ": 0.10  # BGBl III 39/2007 Art 10(2)(a)
+    "DE": 0.15  # BGBl III 182/2002 Art 10(2)(b)
+    "DK": 0.15  # BGBl III 41/2008 Art 10(2)(b)
+    "ES": 0.15  # BGBl 395/1967 Art 10(2)(b)
+    "FI": 0.10  # BGBl III 42/2001 Art 10(2)
+    "FR": 0.15  # BGBl 613/1994 Art 10(2)(a)
+    "GB": 0.10  # BGBl III 32/2019 Art 10(2)(a)(i); REIT/PAIF PIDs 0.15 (not modelled)
+    "GR": 0.15  # BGBl III 16/2009 Art 10(2)(b)
+    "HK": 0.10  # BGBl III 9/2011 Art 10(2)(a)
+    "HU": 0.10  # BGBl 52/1976 Art 10(2)
+    "IE": 0.00  # BGBl 66/1968 idF BGBl 12/1989 Art 8(1)(c): exempt at source
+    "IL": 0.10  # BGBl III 8/2018 Art 10(2)(b)
+    "IN": 0.10  # BGBl III 231/2001 Art 10(2)
+    "IT": 0.15  # BGBl 125/1985 Art 10(2)
+    "JP": 0.10  # BGBl III 167/2018 Art 10(2)
+    "KR": 0.15  # BGBl 486/1987 Art 10(2)(b); Art 23 deemed credit NOT applied
+    "LU": 0.15  # BGBl 54/1964 Art 10(2)(b)
+    "MX": 0.10  # BGBl III 142/2004 Art 10(2)(b)
+    "NL": 0.15  # BGBl 191/1971 Art 10(2)
+    "NO": 0.15  # BGBl III 1/1997 idF BGBl III 181/2006 Art 10(2)
+    "NZ": 0.15  # BGBl III 127/2007 Art 10(2)(b)
+    "PL": 0.15  # BGBl III 12/2005 Art 10(2)(b)
+    "PT": 0.15  # BGBl 85/1972 Art 10(2)
+    "SE": 0.10  # BGBl 39/1960 idF BGBl 132/1993 Art 10(2)(b)
+    "SG": 0.10  # BGBl III 248/2002 Art 10(2)(a)
+    "TW": 0.10  # BGBl II 385/2014 Art 10(2)
+    "US": 0.15  # BGBl III 6/1998 Art 10(2)(b)
+    "ZA": 0.15  # BGBl III 40/1997 Art 10(2)(b)
+  # Interest articles of Austria's treaties largely deny or limit source
+  # taxation; no interest credit is granted unless a country is listed here.
+  interest_caps: {}
+  # Treaties suspended by the other state (§ 48 Abs 5 BAO relief only).
+  manual_review_countries: ["BY", "RU"]
 
-# Classification rules. First match wins.
-# Supported match keys: tx_type, asset_class (single value or list).
+# EStR Rz 6201: converting a foreign-currency balance into EUR or a currency
+# that is stable against the EUR is a taxable exchange; into another floating
+# currency it is not. ERM-II members are treated as stable.
+eur_stable_currencies: [BGN, DKK]
+
+# Classification: first match wins. Keys: tx_type, asset_class (value or
+# list), credit_institution (bool, from rules/brokers.yaml).
 classification:
+  # Realized results (pool sales, RoC excess, FX-balance disposals).
   - when: { tx_type: SELL, asset_class: [STOCK, ETF, BOND] }
-    bucket: einkuenfte_realisierte_wertsteigerungen_27_5
+    bucket: realisiert_ueberschuesse_27_5
+    note: "Aktien, Anleihen, Fondsanteile – § 27 Abs 3"
+  - when: { tx_type: SELL, asset_class: DERIVATIVE }
+    bucket: derivate_ueberschuesse_27_5
+    note: "Verbriefte Derivate inkl. ETC/ETN/Zertifikate – § 27 Abs 4"
+  - when: { tx_type: SELL, asset_class: CASH, credit_institution: true }
+    bucket: realisiert_ueberschuesse_25
+    note: "FX gain on a deposit at a credit institution (Anm 8)"
+  - when: { tx_type: SELL, asset_class: CASH }
+    bucket: realisiert_ueberschuesse_27_5
+    note: "FX gain on a cash balance at a non-bank broker (EStR Rz 6223)"
 
-  - when: { tx_type: DIVIDEND_CASH }
-    bucket: einkuenfte_ueberlassung_27_5
+  # Fund distributions (§ 186 InvFG) are separate from 863.
+  - when: { tx_type: [DIVIDEND_CASH, DIVIDEND_STOCK], asset_class: ETF }
+    bucket: fonds_ausschuettungen_27_5
 
-  # Stock dividends (Aktiendividenden) — not currently emitted by any parser.
-  # Kept in the classification table so TaxRules.validate_schema() coverage
-  # check passes; bucket null = no E1kv entry. If a parser ever emits
-  # DIVIDEND_STOCK rows, pool.py would also need an explicit handler — today
-  # the pool's apply() falls through and the shares are neither booked nor
-  # costed. Re-evaluate before adding a parser that produces this type.
-  - when: { tx_type: DIVIDEND_STOCK }
-    bucket: null
-    note: "NOT emitted by any current parser; no pool handler — do not use"
+  - when: { tx_type: [DIVIDEND_CASH, DIVIDEND_STOCK, BONUS_SHARE, PROMO_BONUS, INTEREST_OTHER] }
+    bucket: ueberlassung_27_5
+    note: "Dividends, coupons, share lending, promo bonuses (EStR Rz 6132)"
 
-  # Return of capital / Einlagenrückzahlung (§ 4 Abs. 12 EStG) — NOT taxable
-  # as Kapitalertrag. The pool layer automatically reduces the position's
-  # cost basis by the payout; any excess over remaining basis is emitted as
-  # a realized capital gain in the 27,5 %-Wertsteigerungs-bucket (§ 27 Abs.
-  # 5 Z 1 EStG). This classification entry keeps RoC OUT of the dividend
-  # bucket (bucket: null).
-  - when: { tx_type: RETURN_OF_CAPITAL }
-    bucket: null
-    note: "RoC reduces cost basis; excess becomes realized gain via pool layer"
+  # Cash interest and cashback: 25 % only at a credit institution
+  # (§ 27a Abs 1 Z 1; EStR Rz 6134 for cashback, Rz 6223 for non-banks).
+  - when: { tx_type: [INTEREST, CASHBACK], credit_institution: true }
+    bucket: zinsen_kreditinstitute_25
+  - when: { tx_type: [INTEREST, CASHBACK] }
+    bucket: ueberlassung_27_5
 
-  # § 27a Abs. 1 Z 1 EStG — Zinsen aus Geldeinlagen bei Kreditinstituten:
-  # 25 % besonderer Steuersatz → KZ 857. Use this ONLY for a genuine bank
-  # deposit; broker cash interest and share-lending income go into
-  # INTEREST_OTHER below.
-  - when: { tx_type: INTEREST }
-    bucket: zinsen_geldeinlagen_25
-
-  # § 27a Abs. 1 Z 2 EStG — 27,5 %-Topf: Zinsen aus sonstigen
-  # Kapitalforderungen, Bond-Kupons, Broker-Cash-Zinsen, share-lending etc.
-  - when: { tx_type: INTEREST_OTHER }
-    bucket: einkuenfte_ueberlassung_27_5
-    note: "Non-bank interest: bond coupons, broker cash, share-lending, etc."
-
-  # Bonus shares / Stockperk: no income event in v1 (zero-cost lot is created
-  # on the pool side). Keep here as IGNORED so engine knows the row was seen.
-  - when: { tx_type: BONUS_SHARE }
-    bucket: null
-    note: "v1: treated as zero-cost lot, no income at receipt; user must review"
-
-  - when: { tx_type: [DEPOSIT_CASH, WITHDRAWAL_CASH, FEE, SPLIT, IGNORED, MIGRATION_IN, MIGRATION_OUT, BUY] }
+  # No income at the row itself (pool / ledger events, cash movements).
+  - when:
+      tx_type: [BUY, SPLIT, EXCHANGE_OUT, EXCHANGE_IN, SPINOFF_IN, MIGRATION_IN,
+                MIGRATION_OUT, RETURN_OF_CAPITAL, DEPOSIT_CASH, WITHDRAWAL_CASH,
+                FEE, FX_CONVERSION, WITHHOLDING_TAX, IGNORED]
     bucket: null

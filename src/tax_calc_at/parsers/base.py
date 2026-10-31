@@ -3,11 +3,46 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
+from datetime import date
 from pathlib import Path
+from typing import Any
 
 import yaml
 
-from ..model import AssetClass
+from ..model import (
+    FLAG_CA_UNCLASSIFIED,
+    AssetClass,
+    Flag,
+    ParseReport,
+    Severity,
+    Transaction,
+    TxType,
+)
+
+
+def make_tx(base: Mapping[str, Any], **fields: Any) -> Transaction:
+    """Build a Transaction from per-row common fields plus row-specific ones
+    (later keys win, so a field of ``base`` can be overridden)."""
+    kwargs: dict[str, Any] = {**base, **fields}
+    return Transaction(**kwargs)
+
+
+def unclassified_share_increase(detail: str) -> Flag:
+    """Blocker for shares added to a held position whose legal form the export
+    does not state. A share split, or a capital increase from company funds of
+    a company comparable to an Austrian corporation, is tax-neutral (KapMaßVO
+    §§ 4 Abs 1, 6; EStR Rz 306, 308 — the taxpayer must prove comparability);
+    a stock dividend or bonus shares out of profits are income at market value
+    (§ 27 Abs 2 Z 1 EStG; EStR Rz 307; BFG RV/5100407/2024)."""
+    return Flag(
+        FLAG_CA_UNCLASSIFIED,
+        Severity.ERROR,
+        f"{detail} Declare it in rules/corporate_actions.yaml: treatment `split` "
+        "(share split / capital increase from company funds) or "
+        "`taxable_distribution` (stock dividend, bonus shares out of profits; "
+        "`quantity` for the taxable part of a combined booking).",
+    )
 
 
 def file_sha256(path: Path) -> str:
@@ -19,54 +54,44 @@ def file_sha256(path: Path) -> str:
 
 
 # ---- Per-ISIN asset-class override loader -------------------------------
-# Broker exports with no asset-class field (notably Trading 212) would fall
-# back to STOCK for every ISIN, letting ETFs silently bypass the engine's
-# ETF blocker. `rules/asset_class_overrides.yaml` lets the user pin the
-# correct class for specific ISINs.
-_OVERRIDES_FILE = (
-    Path(__file__).resolve().parents[3] / "rules" / "asset_class_overrides.yaml"
-)
+# Broker exports without an asset-class field would fall back to STOCK for
+# every ISIN. `rules/asset_class_overrides.yaml` (public) and
+# `rules/local/asset_class_overrides.yaml` (personal, git-ignored; wins on
+# conflict) pin the class per ISIN.
 _OVERRIDES_CACHE: dict[str, AssetClass] | None = None
-_OVERRIDES_MTIME: float | None = None
+_OVERRIDES_KEY: tuple[tuple[str, float], ...] | None = None
 
 
 def _load_overrides() -> dict[str, AssetClass]:
-    """Load the overrides YAML, auto-reloading when the file changes.
+    """Load the override files, re-reading when any of them changes (the
+    long-running Streamlit process picks up edits without a restart)."""
+    from ..engine.rules import rule_files
 
-    Using the file's mtime as the cache key means the long-running Streamlit
-    process picks up edits to asset_class_overrides.yaml without a restart —
-    important because the user has to iterate on overrides when the engine
-    reports 'UCITS misclassified as STOCK'.
-    """
-    global _OVERRIDES_CACHE, _OVERRIDES_MTIME
-    if not _OVERRIDES_FILE.exists():
-        _OVERRIDES_CACHE = {}
-        _OVERRIDES_MTIME = None
+    global _OVERRIDES_CACHE, _OVERRIDES_KEY
+    paths = rule_files("asset_class_overrides.yaml")
+    key = tuple((str(p), p.stat().st_mtime) for p in paths)
+    if _OVERRIDES_CACHE is not None and key == _OVERRIDES_KEY:
         return _OVERRIDES_CACHE
-    mtime = _OVERRIDES_FILE.stat().st_mtime
-    if _OVERRIDES_CACHE is not None and _OVERRIDES_MTIME == mtime:
-        return _OVERRIDES_CACHE
-    raw = yaml.safe_load(_OVERRIDES_FILE.read_text(encoding="utf-8")) or {}
-    overrides = raw.get("overrides") or {}
     out: dict[str, AssetClass] = {}
-    for isin, name in overrides.items():
-        try:
-            out[str(isin).upper()] = AssetClass(str(name).upper())
-        except ValueError as e:
-            raise ValueError(
-                f"Invalid asset class {name!r} for ISIN {isin!r} in "
-                f"{_OVERRIDES_FILE}: {e}"
-            ) from e
+    for path in paths:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for isin, name in (raw.get("overrides") or {}).items():
+            try:
+                out[str(isin).upper()] = AssetClass(str(name).upper())
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid asset class {name!r} for ISIN {isin!r} in {path}: {e}"
+                ) from e
     _OVERRIDES_CACHE = out
-    _OVERRIDES_MTIME = mtime
+    _OVERRIDES_KEY = key
     return _OVERRIDES_CACHE
 
 
 def reset_overrides_cache() -> None:  # pragma: no cover - for tests
     """Force the next call to re-read the overrides YAML (test helper)."""
-    global _OVERRIDES_CACHE, _OVERRIDES_MTIME
+    global _OVERRIDES_CACHE, _OVERRIDES_KEY
     _OVERRIDES_CACHE = None
-    _OVERRIDES_MTIME = None
+    _OVERRIDES_KEY = None
 
 
 def asset_class_override_for(isin: str | None) -> AssetClass | None:
@@ -79,11 +104,6 @@ def asset_class_override_for(isin: str | None) -> AssetClass | None:
     if not isin:
         return None
     return _load_overrides().get(isin.upper())
-
-
-# ISIN prefix heuristic for "likely an Irish/Luxembourg fund or ETF" — used
-# only to raise a soft warning, never to override the caller's hint.
-_LIKELY_FUND_PREFIXES = ("IE00B", "IE00BD", "LU0", "LU1", "LU2")
 
 
 def asset_class_from_isin(isin: str | None, hint: str | None = None) -> AssetClass:
@@ -106,6 +126,8 @@ def asset_class_from_isin(isin: str | None, hint: str | None = None) -> AssetCla
             return AssetClass.BOND
         if h in {"ETF", "FUND", "FONDS"}:
             return AssetClass.ETF
+        if h in {"DERIVATIVE", "DERIVATIVES", "WAR", "WARRANT", "CERTIFICATE", "ETC", "ETN"}:
+            return AssetClass.DERIVATIVE
         if h in {"STOCK", "STK", "EQUITY", "SHARE", "SHARES"}:
             return AssetClass.STOCK
         if h in {"CRYPTO", "CRYPTOCURRENCY"}:
@@ -118,11 +140,52 @@ def asset_class_from_isin(isin: str | None, hint: str | None = None) -> AssetCla
     return AssetClass.OTHER
 
 
-def isin_looks_like_fund(isin: str | None) -> bool:
-    """True for ISINs whose prefix strongly suggests a UCITS fund / ETF.
+def apply_steuereinfach_cutoff(
+    txns: list[Transaction],
+    report: ParseReport,
+    cutoff: date | None,
+    *,
+    strict: bool = False,
+) -> None:
+    """Exclude rows on/after the date the account became steuereinfach.
 
-    Used to raise a soft warning — never to auto-classify."""
-    if not isin:
-        return False
-    up = isin.upper()
-    return any(up.startswith(p) for p in _LIKELY_FUND_PREFIXES)
+    From that date the broker withholds Austrian KESt itself; the rows stay
+    in the audit trail as IGNORED with a WARNING. ``strict`` raises instead.
+    """
+    from ..model import CutoffViolationError
+
+    if cutoff is None:
+        return
+    hit = False
+    for tx in txns:
+        if tx.trade_date < cutoff or tx.tx_type is TxType.IGNORED:
+            continue
+        if strict:
+            raise CutoffViolationError(
+                f"{tx.broker} became steuereinfach on {cutoff}; row "
+                f"{tx.source_file}:{tx.source_line} is dated {tx.trade_date}. "
+                f"Export only rows before {cutoff}."
+            )
+        hit = True
+        original = tx.tx_type
+        tx.tx_type = TxType.IGNORED
+        tx.notes = f"Post-cutoff {original.value} — taxed by the broker (steuereinfach)"
+        tx.flags.append(
+            Flag("broker.post_cutoff", Severity.INFO, "Excluded: broker is steuereinfach.")
+        )
+        report.rows_rejected += 1
+        report.rows_emitted -= 1
+        report.rows_ignored += 1
+    if hit:
+        report.add_flag(
+            "broker.post_cutoff",
+            Severity.WARNING,
+            f"Rows on/after {cutoff} are handled by the broker's Austrian KESt "
+            f"(steuereinfach) and excluded from tax math.",
+        )
+
+
+def count_rows(txns: list[Transaction], report: ParseReport) -> None:
+    """Fill ``rows_emitted`` / ``rows_ignored`` from the parsed transactions."""
+    report.rows_emitted = sum(1 for t in txns if t.tx_type is not TxType.IGNORED)
+    report.rows_ignored = sum(1 for t in txns if t.tx_type is TxType.IGNORED)

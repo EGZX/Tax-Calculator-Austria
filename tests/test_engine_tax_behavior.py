@@ -1,562 +1,342 @@
-"""Engine-level tax-behavior tests.
+"""E1kv engine: Kennzahlen, gross reporting, foreign-tax credit, loss offset."""
 
-These verify the *math* the engine performs once parsing + FX conversion are
-done, not just YAML metadata: gross-up of net dividends with withholding,
-DBA credit cap, per-country override, exclusion of return-of-capital from
-income buckets, and inclusion of credit Kennzahlen in by_kennzahl().
-"""
 from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+from conftest import mk
+
 from tax_calc_at.engine.e1kv import build_report
 from tax_calc_at.engine.rules import load_tax_rules
-from tax_calc_at.model import AssetClass, FxSource, Transaction, TxType
+from tax_calc_at.model import (
+    FLAG_CA_UNCLASSIFIED,
+    FLAG_PAYMENT_IN_LIEU,
+    FLAG_WHT_COUNTRY_UNCERTAIN,
+    FLAG_WHT_NOT_DISCLOSED,
+    AssetClass,
+    Flag,
+    ReportNotFileableError,
+    Severity,
+    TxType,
+)
+from tax_calc_at.pool import RealizedEvent
+
+D = Decimal
 
 
-def _div(
-    *,
-    net_eur: str,
-    wh_eur: str,
-    country: str | None = "US",
-    isin: str = "US0378331005",
-    line: int = 1,
-) -> Transaction:
-    tx = Transaction(
-        broker="t212",
-        trade_date=date(2024, 6, 1),
-        tx_type=TxType.DIVIDEND_CASH,
-        asset_class=AssetClass.STOCK,
-        quantity=Decimal("0"),
-        currency_native="EUR",
-        gross_native=Decimal(net_eur),
-        source_file="x.csv",
-        source_line=line,
-        isin=isin,
-        withholding_country=country,
-    )
-    tx.amount_eur = Decimal(net_eur)
-    tx.tax_withheld_eur = Decimal(wh_eur)
-    tx.fx_rate_used = Decimal("1")
-    tx.fx_rate_source = FxSource.NATIVE_EUR
-    # Helper takes net_eur explicitly — declare NET convention so the engine
-    # grosses up (dividend_is_net now defaults to None and is a hard blocker).
-    tx.dividend_is_net = True
-    return tx
+def _report(txns, realized=(), year=2024, brokers=None):
+    from tax_calc_at.engine.rules import load_brokers
 
-
-def _roc(*, amount_eur: str, isin: str = "US0378331005", line: int = 2) -> Transaction:
-    tx = Transaction(
-        broker="t212",
-        trade_date=date(2024, 6, 2),
-        tx_type=TxType.RETURN_OF_CAPITAL,
-        asset_class=AssetClass.STOCK,
-        quantity=Decimal("0"),
-        currency_native="EUR",
-        gross_native=Decimal(amount_eur),
-        source_file="x.csv",
-        source_line=line,
-    )
-    tx.amount_eur = Decimal(amount_eur)
-    tx.tax_withheld_eur = Decimal("0")
-    tx.fx_rate_used = Decimal("1")
-    tx.fx_rate_source = FxSource.NATIVE_EUR
-    return tx
-
-
-def test_dividend_grossup_net_plus_withholding_is_income():
-    """Net dividend of 85 EUR with 15 EUR withholding → 100 EUR income."""
-    rules = load_tax_rules(2024)
-    tx = _div(net_eur="85", wh_eur="15", country="US")
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    income = rep.buckets["einkuenfte_ueberlassung_27_5"].total_eur
-    assert income == Decimal("100")
-
-
-def test_withholding_credit_capped_at_15_percent_default():
-    """Withholding of 30 EUR on 100 EUR gross is capped at 15 % = 15 EUR."""
-    rules = load_tax_rules(2024)
-    # Net 70, WH 30 → gross 100; cap = 15 % * 100 = 15.
-    tx = _div(net_eur="70", wh_eur="30", country="ZZ")  # ZZ → no override → default cap
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    credit = rep.creditable_withholding["anrechenbare_quellensteuer_27_5"]
-    assert credit == Decimal("15.00")
-
-
-def test_credit_cap_is_global_15_percent_even_with_country_override_present():
-    """Country-specific caps above 15% are clamped; Austrian ceiling stays 15%."""
-    rules = load_tax_rules(2024)
-    # Even if a country-specific cap is misconfigured above 15%, the hard
-    # Austrian ceiling wins. See also test_country_cap_never_raises_above_...
-    rules.foreign_withholding.country_caps["CH"] = Decimal("0.25")
-    tx = _div(
-        net_eur="65", wh_eur="35", country="CH", isin="CH0038863350"
-    )  # gross 100, WH 35
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    credit = rep.creditable_withholding["anrechenbare_quellensteuer_27_5"]
-    assert credit == Decimal("15.00")
-
-
-def test_credit_cap_never_exceeds_15_even_if_default_is_misconfigured_higher():
-    """Configured defaults above 15% must not increase creditable withholding."""
-    rules = load_tax_rules(2024)
-    # Simulate a bad config edit; engine must still enforce hard 15% ceiling.
-    rules.foreign_withholding.default_creditable_cap = Decimal("0.30")
-    # Country without a per-country cap → falls through to default → clamped.
-    tx = _div(net_eur="70", wh_eur="30", country="ZZ")  # gross 100, WH 30
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    credit = rep.creditable_withholding["anrechenbare_quellensteuer_27_5"]
-    assert credit == Decimal("15.00")
-
-
-def test_country_specific_cap_lowers_creditable_withholding():
-    """Japan DBA cap is 10%: withholding above 10% of gross is not creditable.
-
-    Gross 100, WH 15 → creditable = min(15, 100 * 10%) = 10.
-    The 5 EUR excess surfaces as uncreditable_withholding.
-    """
-    rules = load_tax_rules(2024)
-    assert rules.foreign_withholding.country_caps["JP"] == Decimal("0.10")
-    tx = _div(
-        net_eur="85", wh_eur="15", country="JP", isin="JP3633400001"
-    )  # gross 100
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    assert rep.creditable_withholding["anrechenbare_quellensteuer_27_5"] == Decimal(
-        "10.00"
-    )
-    assert rep.uncreditable_withholding["anrechenbare_quellensteuer_27_5"] == Decimal(
-        "5.00"
+    return build_report(
+        year=year,
+        rules=load_tax_rules(year),
+        transactions=list(txns),
+        realized=list(realized),
+        brokers=brokers or load_brokers(),
     )
 
 
-def test_country_cap_never_raises_above_global_15_percent():
-    """Even if a country is (mis-)configured above 15%, the 15% ceiling wins."""
-    rules = load_tax_rules(2024)
-    rules.foreign_withholding.country_caps["CH"] = Decimal("0.25")
-    tx = _div(
-        net_eur="65", wh_eur="35", country="CH", isin="CH0038863350"
-    )  # gross 100
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    credit = rep.creditable_withholding["anrechenbare_quellensteuer_27_5"]
-    assert credit == Decimal("15.00")
+def _div(gross, wh="0", country="US", *, net=False, isin="US0378331005", line=1, **kw):
+    """Dividend with GROSS (net=False) or NET (net=True) amount_eur."""
+    amount = D(gross) - D(wh) if net else D(gross)
+    return mk(TxType.DIVIDEND_CASH, amount_eur=str(amount), withheld_eur=wh, country=country,
+              is_net=net, isin=isin, line=line, **kw)
 
 
-def test_return_of_capital_excluded_from_dividend_bucket():
-    rules = load_tax_rules(2024)
-    div = _div(net_eur="50", wh_eur="0", country="US", line=1)
-    roc = _roc(amount_eur="40", line=2)
-    rep = build_report(
-        year=2024, rules=rules, transactions=[div, roc], realized=[]
+def _ev(pnl, asset_class=AssetClass.STOCK, broker="scalable_capital", isin="US0378331005"):
+    return RealizedEvent(
+        trade_date=date(2024, 7, 1), broker=broker, isin=isin, symbol=None, name=None,
+        asset_class=asset_class, quantity=D("1"), proceeds_eur=D("100"),
+        cost_basis_eur=D("100") - D(pnl), pnl_eur=D(pnl), source_ref="t.csv:9",
     )
-    income = rep.buckets["einkuenfte_ueberlassung_27_5"].total_eur
-    # Only the dividend, NOT the return of capital, may flow into the bucket.
-    assert income == Decimal("50")
 
 
-def test_by_kennzahl_includes_creditable_withholding():
-    rules = load_tax_rules(2024)
-    tx = _div(net_eur="70", wh_eur="30", country="ZZ")
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
+# ------------------------------------------------------------- Kennzahlen
+def test_kennzahl_numbers_match_bmf_form():
+    """KZ verified against the BMF E 1kv 2023–2025 forms (foreign column)."""
+    for year in (2023, 2024, 2025):
+        nrs = {k: v.nr for k, v in load_tax_rules(year).kennzahlen.items()}
+        assert nrs == {
+            "zinsen_kreditinstitute_25": 861,  # was wrongly 857 (tariff income!)
+            "ueberlassung_27_5": 863,
+            "realisiert_ueberschuesse_27_5": 994,
+            "realisiert_ueberschuesse_25": 865,
+            "realisiert_verluste": 892,
+            "derivate_ueberschuesse_27_5": 995,
+            "derivate_verluste": 896,
+            "fonds_ausschuettungen_27_5": 898,
+            "fonds_age_27_5": 937,
+            "anrechenbare_qst_27_5": 998,
+            "anrechenbare_qst_25": 901,  # was wrongly 799 (not on the form)
+        }
+
+
+def test_2026_form_unpublished_blocks_filing():
+    rep = _report([mk(TxType.DIVIDEND_CASH, day=date(2026, 3, 1), amount_eur="100")], year=2026)
+    assert any("Unverified Kennzahl" in b for b in rep.health.blockers)
+
+
+def test_interest_bank_vs_non_bank(brokers):
+    """25 % only for deposits at a credit institution (§ 27a Abs 1 Z 1)."""
+    rep = _report([
+        mk(TxType.INTEREST, broker="trade_republic", amount_eur="10", isin=None,
+           asset_class=AssetClass.CASH, line=1),
+        mk(TxType.INTEREST, broker="ibkr", amount_eur="7", isin=None,
+           asset_class=AssetClass.CASH, line=2),
+        mk(TxType.INTEREST_OTHER, broker="trade_republic", amount_eur="3", line=3),
+    ])
     flat = rep.by_kennzahl()
-    # Income KZ 863 = 100, credit KZ 998 = 15 — both present in the flat dict.
-    assert flat[863] == Decimal("100.00")
-    assert flat[998] == Decimal("15.00")
+    assert flat[861] == D("10.00")
+    assert flat[863] == D("10.00")  # IBKR interest 7 + coupon 3
 
 
-def test_t212_parser_emits_missing_withholding_flag(tmp_path):
-    """A real T212-shaped Dividend row gets the missing-wh flag."""
-    from tax_calc_at.parsers.trading212 import parse as t212_parse
+def test_cashback_and_promo_bonus_are_income():
+    rep = _report([
+        mk(TxType.CASHBACK, broker="trade_republic", amount_eur="3.00", isin=None,
+           asset_class=AssetClass.CASH, line=1),  # Saveback → 861 (Rz 6134)
+        mk(TxType.CASHBACK, broker="trading212", amount_eur="1.00", isin=None,
+           asset_class=AssetClass.CASH, line=2),  # non-bank → 863
+        mk(TxType.PROMO_BONUS, broker="trading212", amount_eur="10.00", isin=None,
+           asset_class=AssetClass.CASH, line=3),  # free-share promo → 863 (Rz 6132)
+    ])
+    flat = rep.by_kennzahl()
+    assert flat[861] == D("3.00")
+    assert flat[863] == D("11.00")
 
-    csv = tmp_path / "t212.csv"
-    csv.write_text(
-        "Action,Time,ISIN,Ticker,Name,No. of shares,Price / share,"
-        "Currency (Price / share),Total,Currency (Total),Notes,ID\n"
-        'Dividend (Ordinary),2024-06-01 12:00:00,US0378331005,AAPL,Apple,'
-        "0,0,USD,12.34,EUR,,div-1\n",
-        encoding="utf-8",
+
+def test_fund_distribution_goes_to_898_not_863():
+    rep = _report([_div("20", asset_class=AssetClass.ETF, isin="IE00B4L5Y983", country="IE")])
+    assert rep.by_kennzahl(allow_partial=True) == {898: D("20.00")}
+
+
+def test_realized_routing_gain_loss_derivative_fx():
+    rep = _report([], realized=[
+        _ev("50"), _ev("-20"),
+        _ev("30", AssetClass.DERIVATIVE), _ev("-5", AssetClass.DERIVATIVE),
+        _ev("-1", AssetClass.CASH, broker="ibkr"),
+        _ev("2", AssetClass.CASH, broker="trade_republic"),  # bank deposit → 25 %
+    ])
+    assert rep.by_kennzahl() == {
+        994: D("50.00"), 892: D("-21.00"), 995: D("30.00"), 896: D("-5.00"), 865: D("2.00"),
+    }
+
+
+# ------------------------------------------------------- gross reporting
+def test_losses_are_not_netted_into_dividends():
+    """Regression: the engine used to subtract losses from KZ 863 and shrink
+    KZ 892, which also destroyed the KZ 998 credit. The form wants gross
+    figures; the Finanzamt nets (Anm 19)."""
+    rep = _report([_div("300")], realized=[_ev("1000"), _ev("-500")])
+    flat = rep.by_kennzahl()
+    assert flat[863] == D("300.00")
+    assert flat[994] == D("1000.00")
+    assert flat[892] == D("-500.00")
+    assert rep.loss_offset.saldo_1_3_eur == D("800.00")
+
+
+# ------------------------------------------------------------ credit math
+def test_net_dividend_is_grossed_up():
+    rep = _report([_div("100", "15", net=True)])
+    assert rep.by_kennzahl() == {863: D("100.00"), 998: D("15.00")}
+
+
+def test_gross_dividend_is_not_grossed_up_twice():
+    """Regression (IBKR/TR): gross rows flagged NET added the tax twice."""
+    rep = _report([_div("100", "15", net=False)])
+    assert rep.by_kennzahl() == {863: D("100.00"), 998: D("15.00")}
+
+
+@pytest.mark.parametrize(
+    "country,wh,credit,excess",
+    [
+        ("US", "30", "15.00", "15.00"),
+        ("FI", "35", "10.00", "25.00"),  # was 15 % in the old table
+        ("SE", "30", "10.00", "20.00"),  # was 15 % in the old table
+        ("JP", "15.315", "10.00", "5.32"),
+        ("CH", "35", "15.00", "20.00"),
+        ("DK", "27", "15.00", "12.00"),
+        ("IE", "25", "0.00", "25.00"),  # DBA: exempt at source → refundable only
+    ],
+)
+def test_dba_caps(country, wh, credit, excess):
+    rep = _report([_div("100", wh, country)])
+    assert rep.creditable_withholding.get("anrechenbare_qst_27_5", D("0")) == D(credit)
+    assert rep.uncreditable_withholding["anrechenbare_qst_27_5"] == D(excess)
+
+
+def test_unknown_country_blocks_instead_of_default_cap():
+    rep = _report([_div("100", "20", "KZ", isin="KZ1C00000744")])
+    assert any("no DBA dividend rate for KZ" in b for b in rep.health.blockers)
+    assert "anrechenbare_qst_27_5" not in rep.creditable_withholding
+
+
+def test_suspended_treaty_country_blocks():
+    rep = _report([_div("100", "15", "RU", isin="RU0009029540")])
+    assert any("suspended" in b for b in rep.health.blockers)
+
+
+def test_adr_without_declared_country_blocks():
+    tx = _div("100", "21", "US", isin="US8740391003")
+    tx.flags.append(Flag(FLAG_WHT_COUNTRY_UNCERTAIN, Severity.WARNING, "ADR"))
+    rep = _report([tx])
+    assert any("withholding source country is unknown" in b for b in rep.health.blockers)
+
+
+def test_payment_in_lieu_not_credited():
+    tx = _div("100", "15", "US")
+    tx.flags.append(Flag(FLAG_PAYMENT_IN_LIEU, Severity.WARNING, "PIL"))
+    rep = _report([tx])
+    assert rep.by_kennzahl(allow_partial=True) == {863: D("100.00")}
+    assert rep.uncreditable_withholding["anrechenbare_qst_27_5"] == D("15.00")
+
+
+def test_interest_withholding_not_credited():
+    tx = mk(TxType.INTEREST, broker="ibkr", amount_eur="0.11", withheld_eur="0.02",
+            is_net=False, isin=None, asset_class=AssetClass.CASH, country="IE")
+    rep = _report([tx])
+    assert rep.by_kennzahl() == {863: D("0.11")}
+    assert any("not creditable" in w for w in rep.health.warnings)
+
+
+def test_withholding_convention_must_be_declared():
+    rep = _report([_div("85", "15", net=None)])
+    assert any("NET/GROSS convention" in b for b in rep.health.blockers)
+
+
+def test_undisclosed_withholding_blocks_unless_cap_zero():
+    us = _div("85", "0", "US")
+    us.flags.append(Flag(FLAG_WHT_NOT_DISCLOSED, Severity.WARNING, "x"))
+    ie = _div("85", "0", "IE", isin="IE00B4L5Y983", line=2)
+    ie.flags.append(Flag(FLAG_WHT_NOT_DISCLOSED, Severity.WARNING, "x"))
+    assert any("does not disclose" in b for b in _report([us]).health.blockers)
+    assert not any("does not disclose" in b for b in _report([ie]).health.blockers)
+
+
+def test_austrian_kest_dividend_is_excluded():
+    """AT dividend at a foreign depot: KESt withheld by the issuer → final."""
+    tx = _div("16.20", "4.46", "AT", net=True, isin="AT0000A0E9W5")
+    rep = _report([tx])
+    assert rep.by_kennzahl() == {}
+    assert any("final-taxed" in w for w in rep.health.warnings)
+
+
+# ------------------------------------------------- loss offset vs. credit
+def test_rz_7752h_example_credit_reduced_by_loss_offset():
+    """EStR Rz 7752h Beispiel: dividends 100 (WHT 15), gains 50, losses 100.
+    Losses first against the gain (50), then 50 of the dividends → only half
+    of the dividend keeps its credit: 7.50."""
+    rep = _report([_div("100", "15")], realized=[_ev("50"), _ev("-100")])
+    flat = rep.by_kennzahl()
+    assert flat[863] == D("100.00") and flat[994] == D("50.00") and flat[892] == D("-100.00")
+    assert flat[998] == D("7.50")
+    assert rep.credit_lost_to_loss_offset["anrechenbare_qst_27_5"] == D("7.50")
+
+
+def test_loss_offset_uses_income_without_credit_first():
+    """WHT-free income (broker interest) absorbs losses before dividends."""
+    rep = _report(
+        [_div("100", "15"),
+         mk(TxType.INTEREST, broker="ibkr", amount_eur="80", isin=None,
+            asset_class=AssetClass.CASH, line=2)],
+        realized=[_ev("-80")],
     )
-    txns, _ = t212_parse(csv)
-    assert len(txns) == 1
-    tx = txns[0]
-    assert tx.tx_type is TxType.DIVIDEND_CASH
-    assert tx.withholding_country == "US"
-    assert any(f.code == "t212.missing_withholding_detail" for f in tx.flags)
+    assert rep.creditable_withholding["anrechenbare_qst_27_5"] == D("15.00")
 
 
-def test_t212_parser_splits_return_of_capital(tmp_path):
-    from tax_calc_at.parsers.trading212 import parse as t212_parse
-
-    csv = tmp_path / "t212.csv"
-    csv.write_text(
-        "Action,Time,ISIN,Ticker,Name,No. of shares,Price / share,"
-        "Currency (Price / share),Total,Currency (Total),Notes,ID\n"
-        'Dividend (Return of capital),2024-06-01 12:00:00,US0378331005,AAPL,'
-        "Apple,0,0,USD,5.00,EUR,,roc-1\n",
-        encoding="utf-8",
+def test_loss_offset_prefers_lowest_credit_ratio():
+    """Losses consume the dividend with the lower credit ratio first."""
+    rep = _report(
+        [_div("100", "15", "US", line=1),
+         _div("100", "10", "JP", isin="JP3633400001", line=2)],
+        realized=[_ev("-100")],
     )
-    txns, _ = t212_parse(csv)
-    assert len(txns) == 1
-    tx = txns[0]
-    assert tx.tx_type is TxType.RETURN_OF_CAPITAL
-    assert any(f.code == "t212.return_of_capital" for f in tx.flags)
+    # JP (10 %) fully consumed, US (15 %) credit intact.
+    assert rep.creditable_withholding["anrechenbare_qst_27_5"] == D("15.00")
 
 
-def test_scalable_distribution_defaults_to_dividend_without_ambiguous_flag(tmp_path):
-    from tax_calc_at.parsers.scalable import parse as sc_parse
+def test_unabsorbed_losses_warned():
+    rep = _report([], realized=[_ev("-100")])
+    assert rep.loss_offset.unabsorbed_eur == D("100.00")
+    assert any("lost" in w for w in rep.health.warnings)
 
-    csv = tmp_path / "sc.csv"
-    csv.write_text(
-        "date;time;status;reference;description;assetType;type;isin;shares;"
-        "price;amount;fee;tax;currency\n"
-        '2024-06-01;12:00:00;Executed;"REF1";"Apple Dividend";Stock;'
-        "Distribution;US0378331005;0;0;12,34;0;0;EUR\n",
-        encoding="utf-8",
+
+def test_25_percent_interest_not_offsettable():
+    rep = _report(
+        [mk(TxType.INTEREST, broker="trade_republic", amount_eur="50", isin=None,
+            asset_class=AssetClass.CASH)],
+        realized=[_ev("-50")],
     )
-    txns, _ = sc_parse(csv)
-    assert len(txns) == 1
-    tx = txns[0]
-    assert tx.tx_type is TxType.DIVIDEND_CASH
-    assert tx.withholding_country == "US"
-    assert not any(f.code == "scalable.distribution_ambiguous" for f in tx.flags)
+    assert rep.loss_offset.unabsorbed_eur == D("50.00")
 
 
-def test_scalable_distribution_can_be_overridden_to_roc(tmp_path, monkeypatch):
-    from tax_calc_at.parsers import scalable as sc
-
-    overrides = tmp_path / "ov.yaml"
-    overrides.write_text(
-        """
-overrides:
-  - isin: US0378331005
-    date_from: 2024-06-01
-    date_to: 2024-06-01
-    reference_regex: '^REF1$'
-    tx_type: RETURN_OF_CAPITAL
-    note: test override
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(sc, "_DIST_OVERRIDES_FILE", Path(overrides))
-    sc.reset_distribution_overrides_cache()
-
-    csv = tmp_path / "sc.csv"
-    csv.write_text(
-        "date;time;status;reference;description;assetType;type;isin;shares;"
-        "price;amount;fee;tax;currency\n"
-        '2024-06-01;12:00:00;Executed;"REF1";"Apple Distribution";Stock;'
-        "Distribution;US0378331005;0;0;12,34;0;0;EUR\n",
-        encoding="utf-8",
-    )
-    txns, _ = sc.parse(csv)
-    assert len(txns) == 1
-    tx = txns[0]
-    assert tx.tx_type is TxType.RETURN_OF_CAPITAL
-    assert any(f.code == "scalable.distribution_override_roc" for f in tx.flags)
+# -------------------------------------------------------------- gating
+def test_by_kennzahl_refuses_with_blockers():
+    rep = _report([_div("100", "20", "KZ", isin="KZ1C00000744")])
+    with pytest.raises(ReportNotFileableError):
+        rep.by_kennzahl()
 
 
-# ---------------------------------------------------------- post-audit regressions
+def test_row_warnings_surface_in_report():
+    tx = _div("10")
+    tx.flags.append(Flag("x.custom", Severity.WARNING, "needs review"))
+    rep = _report([tx])
+    assert any("[x.custom]" in w for w in rep.health.warnings)
 
 
-def _interest_tx(
-    *,
-    tx_type: TxType,
-    amount_eur: str,
-    asset_class: AssetClass = AssetClass.CASH,
-    line: int = 1,
-) -> Transaction:
-    tx = Transaction(
-        broker="ibkr",
-        trade_date=date(2024, 6, 1),
-        tx_type=tx_type,
-        asset_class=asset_class,
-        quantity=Decimal("0"),
-        currency_native="EUR",
-        gross_native=Decimal(amount_eur),
-        source_file="x.csv",
-        source_line=line,
-    )
-    tx.amount_eur = Decimal(amount_eur)
-    tx.fx_rate_used = Decimal("1")
-    tx.fx_rate_source = FxSource.NATIVE_EUR
-    return tx
-
-
-def test_interest_other_routes_to_27_5_bucket():
-    """Broker interest / bond coupons / share-lending → KZ 863 (27,5 %)."""
-    rules = load_tax_rules(2024)
-    tx = _interest_tx(tx_type=TxType.INTEREST_OTHER, amount_eur="50")
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    assert rep.buckets["einkuenfte_ueberlassung_27_5"].total_eur == Decimal("50")
-    assert "zinsen_geldeinlagen_25" not in rep.buckets
-
-
-def test_interest_bank_routes_to_25_bucket():
-    """Deposit interest at a Kreditinstitut → KZ 857 (25 %)."""
-    rules = load_tax_rules(2024)
-    tx = _interest_tx(tx_type=TxType.INTEREST, amount_eur="50")
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    assert rep.buckets["zinsen_geldeinlagen_25"].total_eur == Decimal("50")
-    assert "einkuenfte_ueberlassung_27_5" not in rep.buckets
-
-
-def test_uncreditable_withholding_surfaces_excess():
-    """30 % foreign withholding — only 15 % creditable; 15 % surfaces as excess."""
-    rules = load_tax_rules(2024)
-    tx = _div(net_eur="70", wh_eur="30", country="ZZ")  # default 15 % cap
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    assert rep.creditable_withholding["anrechenbare_quellensteuer_27_5"] == Decimal(
-        "15.00"
-    )
-    assert rep.uncreditable_withholding["anrechenbare_quellensteuer_27_5"] == Decimal(
-        "15.00"
-    )
-
-
-def test_cross_broker_same_isin_emits_warning():
-    """Same ISIN at two brokers → warning (cost basis is per-broker)."""
-    from tax_calc_at.pool import PoolManager
-
-    def _buy(broker: str, line: int) -> Transaction:
-        tx = Transaction(
-            broker=broker,
-            trade_date=date(2024, 1, line),
-            tx_type=TxType.BUY,
-            asset_class=AssetClass.STOCK,
-            quantity=Decimal("10"),
-            currency_native="EUR",
-            gross_native=Decimal("-1000"),
-            source_file=f"{broker}.csv",
-            source_line=line,
-            isin="US0378331005",
-        )
-        tx.amount_eur = Decimal("-1000")
-        tx.fx_rate_source = FxSource.NATIVE_EUR
-        return tx
-
-    pm = PoolManager()
-    pm.replay([_buy("A", 1), _buy("B", 2)])
-    rules = load_tax_rules(2024)
-    rep = build_report(
-        year=2024, rules=rules, transactions=[], realized=[], pool_manager=pm
-    )
-    assert any(
-        "held at multiple brokers" in w and "US0378331005" in w
-        for w in rep.health.warnings
-    )
-
-
-def test_dividend_is_net_unset_blocks_filing():
-    """Withholding without declared NET/GROSS convention → blocker, not silent."""
-    rules = load_tax_rules(2024)
-    tx = _div(net_eur="70", wh_eur="30", country="US")
-    tx.dividend_is_net = None  # undo helper default
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    assert not rep.health.fileable
-    assert any("dividend_is_net is unset" in b for b in rep.health.blockers)
-
-
-def test_2025_realized_sell_split_into_gain_and_loss_kennzahlen():
-    rules = load_tax_rules(2025)
-
-    def _ev(pnl: str, line: str):
-        from tax_calc_at.pool import RealizedEvent
-
-        return RealizedEvent(
-            trade_date=date(2025, 6, 1),
-            broker="scalable_capital",
-            isin="US0378331005",
-            symbol="AAPL",
-            name="Apple",
-            asset_class=AssetClass.STOCK,
-            quantity=Decimal("1"),
-            proceeds_eur=Decimal("100"),
-            cost_basis_eur=Decimal("90"),
-            pnl_eur=Decimal(pnl),
-            source_ref=f"x.csv:{line}",
-        )
-
-    rep = build_report(
-        year=2025,
-        rules=rules,
-        transactions=[],
-        realized=[_ev("10", "1"), _ev("-3", "2")],
-    )
-
-    flat = rep.by_kennzahl(allow_partial=True)
-    assert flat[994] == Decimal("10.00")
-    assert flat[892] == Decimal("-3.00")
-
-
-def test_trade_republic_bonus_share_broker_gift_not_flagged(tmp_path):
-    from datetime import date as _date
-    from tax_calc_at.parsers.trade_republic import parse as tr_parse
-
-    csv = tmp_path / "tr.csv"
-    csv.write_text(
-        '"datetime","date","account_type","category","type","asset_class","name","symbol","shares","price","amount","fee","tax","currency","original_amount","original_currency","fx_rate","description","transaction_id","counterparty_name","counterparty_iban","payment_reference","mcc_code"\n'
-        '"2025-01-02T10:00:00.000Z","2025-01-02","DEFAULT","TRADING","STOCKPERK","ETF","Physical Gold USD (Acc)","IE00B4ND3602","0.123","70.73","8.70","0","0","EUR","","","","","ref-1","","","",""\n',
-        encoding="utf-8",
-    )
-
-    txns, _ = tr_parse(csv, steuereinfach_from=_date(2025, 4, 29))
-    assert len(txns) == 1
-    tx = txns[0]
-    assert tx.tx_type is TxType.BONUS_SHARE
-    assert not any(f.code == "bonus_share_review" for f in tx.flags)
-    assert not any(f.code == "bonus_share_non_broker_source" for f in tx.flags)
-
-
-def test_yaml_schema_validation_rejects_typo_bucket(tmp_path):
-    """load_tax_rules() rejects a YAML whose classification references an
-    unknown bucket — prevents silent income routing to None."""
+# ------------------------------------------------------------ YAML schema
+def test_yaml_rejects_unknown_bucket(tmp_path: Path):
     from tax_calc_at.engine.rules import load_tax_rules as load
 
     p = tmp_path / "tax_9999.yaml"
     p.write_text(
         """
 year: 9999
-rates: {kapitalvermoegen_general: 0.275, zinsen_geldeinlagen: 0.25}
-foreign_withholding: {default_creditable_cap: 0.15}
+form_source: test
+foreign_withholding: {dividend_caps: {"US": 0.15}}
 kennzahlen:
-  bkt: {nr: 863, label: "x"}
-loss_offset:
-  cross_broker: true
-  cross_bucket_within_275_buckets: [bkt]
+  inc: {nr: 863, label: x, kind: income, rate: 0.275}
 classification:
   - when: {tx_type: SELL}
-    bucket: TYPO_BUCKET
+    bucket: TYPO
 """,
         encoding="utf-8",
     )
-    import pytest as _pytest
-
-    with _pytest.raises(ValueError, match="unknown bucket 'TYPO_BUCKET'"):
+    with pytest.raises(ValueError, match="unknown bucket 'TYPO'"):
         load(9999, path=p)
 
 
-def test_t212_dividend_without_withholding_detail_blocks_filing():
-    """Trading 212 dividend row with the missing-WH flag → blocker, not silent."""
-    rules = load_tax_rules(2024)
-    tx = _div(net_eur="85", wh_eur="0", country="US")
-    # _div defaults dividend_is_net=True; the engine sees wh==0 so the old
-    # gross-up branch would silently treat net as gross. The parser flag
-    # declares that the WHT is UNKNOWN — must become a blocker.
-    from tax_calc_at.model import Flag, Severity
-    tx.flags.append(Flag(
-        code="t212.missing_withholding_detail",
-        severity=Severity.WARNING,
-        message="test",
-    ))
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    assert not rep.health.fileable
-    assert any(
-        "does not disclose the withholding amount" in b
-        for b in rep.health.blockers
-    )
-
-
-def test_t212_dividend_flag_does_not_block_zero_cap_country():
-    """IE / GB have 0% cap — nothing to lose to under-reporting, no blocker."""
-    rules = load_tax_rules(2024)
-    # Ireland: country_cap=0.0 in rules.
-    tx = _div(net_eur="85", wh_eur="0", country="IE", isin="IE00B4L5Y983")
-    from tax_calc_at.model import Flag, Severity
-    tx.flags.append(Flag(
-        code="t212.missing_withholding_detail",
-        severity=Severity.WARNING,
-        message="test",
-    ))
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    assert not any(
-        "does not disclose the withholding amount" in b
-        for b in rep.health.blockers
-    )
-
-
-def test_t212_roc_ambiguous_blocks_filing():
-    """RoC row with the ambiguous-net/gross flag → blocker."""
-    rules = load_tax_rules(2024)
-    tx = _roc(amount_eur="40")
-    from tax_calc_at.model import Flag, Severity
-    tx.flags.append(Flag(
-        code="t212.roc_net_gross_ambiguous",
-        severity=Severity.WARNING,
-        message="test",
-    ))
-    rep = build_report(year=2024, rules=rules, transactions=[tx], realized=[])
-    assert not rep.health.fileable
-    assert any(
-        "may be net of foreign withholding" in b
-        for b in rep.health.blockers
-    )
-
-
-def test_trade_republic_stockperk_paired_buy_zero_cost(tmp_path):
-    """STOCKPERK (FMV in EUR) + paired BUY must produce a zero-cost lot."""
-    from datetime import date as _date
-    from tax_calc_at.parsers.trade_republic import parse as tr_parse
-
-    csv = tmp_path / "tr.csv"
-    csv.write_text(
-        '"datetime","date","account_type","category","type","asset_class","name","symbol","shares","price","amount","fee","tax","currency","original_amount","original_currency","fx_rate","description","transaction_id","counterparty_name","counterparty_iban","payment_reference","mcc_code"\n'
-        '"2023-12-28T16:12:09.559467Z","2023-12-28","DEFAULT","CASH","STOCKPERK","STOCK","Tesla","US88160R1014","","","10.170000","","","EUR","","","","Stockperk","ref-sp","","","",""\n'
-        '"2023-12-28T16:21:32.873Z","2023-12-28","DEFAULT","TRADING","BUY","STOCK","Tesla","US88160R1014","0.0435000000","233.750000","-10.17","","","EUR","","","","","ref-buy","","","",""\n',
-        encoding="utf-8",
-    )
-    txns, _ = tr_parse(csv, steuereinfach_from=_date(2025, 4, 29))
-    assert len(txns) == 2
-    buy = next(t for t in txns if t.raw_ref == "ref-buy")
-    # Paired BUY must now be a zero-cost BONUS_SHARE so later SELLs do not
-    # inherit the 10.17 EUR of spurious basis.
-    assert buy.tx_type is TxType.BONUS_SHARE
-    assert buy.gross_native == Decimal("0")
-    assert buy.quantity == Decimal("0.0435")
-    assert any(f.code == "tr.stockperk_paired_buy" for f in buy.flags)
-
-
-def test_trade_republic_stockperk_unpaired_is_unchanged(tmp_path):
-    """A Stockperk without a matching BUY (shares in STOCKPERK row itself)
-    must not be silently repaired — it is already a zero-cost lot."""
-    from datetime import date as _date
-    from tax_calc_at.parsers.trade_republic import parse as tr_parse
-
-    csv = tmp_path / "tr.csv"
-    csv.write_text(
-        '"datetime","date","account_type","category","type","asset_class","name","symbol","shares","price","amount","fee","tax","currency","original_amount","original_currency","fx_rate","description","transaction_id","counterparty_name","counterparty_iban","payment_reference","mcc_code"\n'
-        '"2025-01-02T10:00:00.000Z","2025-01-02","DEFAULT","TRADING","STOCKPERK","ETF","Physical Gold USD (Acc)","IE00B4ND3602","0.123","70.73","8.70","0","0","EUR","","","","","ref-1","","","",""\n',
-        encoding="utf-8",
-    )
-    txns, _ = tr_parse(csv, steuereinfach_from=_date(2025, 4, 29))
-    assert len(txns) == 1
-    assert txns[0].tx_type is TxType.BONUS_SHARE
-    assert txns[0].quantity == Decimal("0.123")
-    assert not any(f.code == "tr.stockperk_paired_buy" for f in txns[0].flags)
-
-
-def test_yaml_schema_validation_requires_full_txtype_coverage(tmp_path):
-    """Missing a TxType in classification → hard error at load time."""
+def test_yaml_requires_full_txtype_coverage(tmp_path: Path):
     from tax_calc_at.engine.rules import load_tax_rules as load
 
     p = tmp_path / "tax_9998.yaml"
     p.write_text(
         """
 year: 9998
-rates: {kapitalvermoegen_general: 0.275, zinsen_geldeinlagen: 0.25}
-foreign_withholding: {default_creditable_cap: 0.15}
+form_source: test
+foreign_withholding: {dividend_caps: {}}
 kennzahlen:
-  bkt: {nr: 863, label: "x"}
-loss_offset:
-  cross_broker: true
-  cross_bucket_within_275_buckets: [bkt]
+  inc: {nr: 863, label: x, kind: income, rate: 0.275}
 classification:
-  - when: {tx_type: SELL}
-    bucket: bkt
+  - when: {tx_type: DIVIDEND_CASH}
+    bucket: inc
 """,
         encoding="utf-8",
     )
-    import pytest as _pytest
-
-    with _pytest.raises(ValueError, match="missing rules for TxType values"):
+    with pytest.raises(ValueError, match="missing rules for TxType values"):
         load(9998, path=p)
+
+
+def test_yaml_country_codes_survive_norway_problem():
+    """`NO:` unquoted would parse as boolean False."""
+    assert load_tax_rules(2024).foreign_withholding.dividend_caps["NO"] == D("0.15")
+
+
+def test_undeclared_share_increase_blocks_its_year_and_later_years():
+    tx = mk(TxType.SPLIT, day=date(2024, 6, 10), qty="10")
+    tx.flags.append(Flag(FLAG_CA_UNCLASSIFIED, Severity.ERROR, "declare me"))
+    assert any(FLAG_CA_UNCLASSIFIED in b for b in _report([tx], year=2024).health.blockers)
+    later = _report([tx], year=2025).health.blockers
+    assert any("earlier corporate action" in b for b in later)
