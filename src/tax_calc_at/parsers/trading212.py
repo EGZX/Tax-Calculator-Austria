@@ -1,30 +1,38 @@
-"""Trading 212 CSV parser.
+"""Trading 212 (Invest) CSV parser.
 
-Two file variants observed:
-  v1 (2024-07 .. 2024-12): no Currency-conversion-fee columns.
-  v2 (from 2024-12):       adds 'Currency conversion fee' + 'Currency (..)' columns.
+Columns appear only when the export period contains data for them (e.g.
+``Withholding tax``, ``Currency conversion fee``, ``Stamp duty``). Values:
 
-Both share the rest of the schema. ``Action`` field drives the tx type.
+* Trades: ``Price / share`` in the instrument currency; ``Exchange rate`` =
+  instrument currency per 1 unit of the account currency (T212's rate);
+  ``Total`` = account-currency cash incl. fees. The trade is booked in the
+  instrument currency (valued at the ECB rate) and, when the account
+  currency differs, T212's automatic conversion is booked as an
+  ``FX_CONVERSION`` at T212's actual rate (EStR Rz 6201b/c). Fees are
+  separate ``FEE`` rows (non-deductible, § 20 Abs 2 EStG).
+* Dividends: ``Price / share`` is the dividend per share AFTER foreign tax;
+  ``Withholding tax`` is in ``Currency (Withholding tax)``. Gross =
+  shares × price + withholding (instrument currency).
 
-USD trades: 'Currency (Price / share)' may be USD while 'Currency (Total)' is
-always EUR (Trading 212 settles in EUR). We keep ``currency_native`` = price
-currency (USD), so that the FX layer applies the **ECB** rate to the gross,
-rather than trusting Trading 212's broker rate. Any conversion fee shown is
-emitted as a separate ``FEE`` transaction so it does not contaminate the
-trade's gross.
+T212 reuses IDs across different transactions, so the dedup reference is
+``ID|Action|Time``. Unknown actions raise :class:`ParserError`.
 """
 
 from __future__ import annotations
 
 import csv
+from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
 
 from ..model import (
+    FLAG_PAYMENT_IN_LIEU,
+    FLAG_ROC_LABEL,
+    FLAG_WHT_NOT_DISCLOSED,
     AssetClass,
     Flag,
-    ParserError,
     ParseReport,
+    ParserError,
     Severity,
     Transaction,
     TxType,
@@ -33,291 +41,290 @@ from ..normalize import (
     country_from_isin,
     is_valid_isin,
     normalize_currency,
-    parse_date,
     parse_datetime,
     parse_decimal,
 )
-from .base import asset_class_from_isin, file_sha256
+from .base import asset_class_from_isin, count_rows, file_sha256, make_tx
 
 BROKER = "trading212"
+ZERO = Decimal("0")
 
-_ACTION_MAP: dict[str, TxType] = {
-    "Market buy": TxType.BUY,
-    "Limit buy": TxType.BUY,
-    "Stop buy": TxType.BUY,
-    "Market sell": TxType.SELL,
-    "Limit sell": TxType.SELL,
-    "Stop sell": TxType.SELL,
-    "Deposit": TxType.DEPOSIT_CASH,
-    "Withdrawal": TxType.WITHDRAWAL_CASH,
-    # Trading 212 is not an Austrian Kreditinstitut; cash-balance interest
-    # falls into the 27,5 %-Topf (§ 27a Abs. 1 Z 2 EStG), not KZ 857.
-    "Interest on cash": TxType.INTEREST_OTHER,
-    "Dividend (Ordinary)": TxType.DIVIDEND_CASH,
-    "Dividend (Dividend)": TxType.DIVIDEND_CASH,
-    # Return of capital is NOT taxable as dividend in AT — see TxType doc.
-    "Dividend (Return of capital)": TxType.RETURN_OF_CAPITAL,
-    "Dividend (Bonus)": TxType.DIVIDEND_CASH,
-    "Dividend": TxType.DIVIDEND_CASH,
-    "Card cashback": TxType.DEPOSIT_CASH,
-    "Currency conversion": TxType.FEE,
-    "Result adjustment": TxType.FEE,
-    "Stock split": TxType.SPLIT,
-    "New card cost": TxType.FEE,
-    "Spending cashback": TxType.DEPOSIT_CASH,
-    "Card fee": TxType.FEE,
-    # Share-lending income is NOT deposit interest — 27,5 %-Topf.
-    "Lending interest": TxType.INTEREST_OTHER,
+_BUYS = {"Market buy", "Limit buy", "Stop buy", "Stop limit buy"}
+_SELLS = {"Market sell", "Limit sell", "Stop sell", "Stop limit sell"}
+_DIVIDENDS = {
+    "Dividend (Ordinary)",
+    "Dividend (Dividend)",
+    "Dividend (Dividends paid by us corporations)",
+    "Dividend (Dividends paid by foreign corporations)",
+    "Dividend (Bonus)",
+    "Dividend (Property income distribution)",
+    "Dividend (Interest)",  # interest distribution of a bond / money-market fund
 }
+_DIVIDEND_PIL = {"Dividend (Dividend manufactured payment)"}
+# Labels suggesting capital repayment: taxed as dividends unless proven.
+_DIVIDEND_ROC_LABEL = {"Dividend (Return of capital)", "Dividend (Tax exempted)",
+                       "Dividend (Demerger)"}
+_CARD = {"Card debit", "Card credit", "Card refund", "New card cost", "Card fee"}
+_FEE_COLUMNS = (
+    "Currency conversion fee",
+    "Transaction fee",
+    "Finra fee",
+    "Stamp duty",
+    "Stamp duty reserve tax",
+    "French transaction tax",
+    "Deposit fee",
+)
+
+
+class _Row:
+    """Access helper tolerant of old header variants like ``Total (EUR)``."""
+
+    def __init__(self, row: dict[str, str], header: list[str]) -> None:
+        self.row = row
+        self.header = header
+
+    def get(self, key: str) -> str:
+        return (self.row.get(key) or "").strip()
+
+    def has(self, key: str) -> bool:
+        return key in self.header
+
+    def money(self, key: str) -> tuple[Decimal, str | None]:
+        """Value and currency of ``key`` (``key`` + ``Currency (key)`` or ``key (CCY)``)."""
+        if self.has(key):
+            ccy = self.get(f"Currency ({key})")
+            return parse_decimal(self.get(key)), normalize_currency(ccy) if ccy else None
+        for h in self.header:
+            if h.startswith(f"{key} (") and h.endswith(")") and len(h) == len(key) + 6:
+                return parse_decimal(self.get(h)), normalize_currency(h[-4:-1])
+        return ZERO, None
 
 
 def parse(path: Path) -> tuple[list[Transaction], ParseReport]:
     report = ParseReport(broker=BROKER, source_file=str(path), file_sha256=file_sha256(path))
     txns: list[Transaction] = []
-
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        for lineno, row in enumerate(reader, start=2):
+        header = list(reader.fieldnames or [])
+        for lineno, raw in enumerate(reader, start=2):
             report.rows_total += 1
+            row = _Row(raw, header)
             try:
-                produced = _parse_row(path, lineno, row, report)
-            except (ParserError, ValueError) as e:
-                if isinstance(e, ParserError):
-                    raise
+                txns.extend(_parse_row(path, lineno, row))
+            except ParserError:
+                raise
+            except (ValueError, ArithmeticError) as e:
                 raise ParserError(
-                    str(e),
-                    broker=BROKER,
-                    source_file=str(path),
-                    source_line=lineno,
-                    raw=",".join(f"{k}={v}" for k, v in row.items()),
+                    str(e), broker=BROKER, source_file=str(path), source_line=lineno,
+                    raw=",".join(f"{k}={v}" for k, v in raw.items()),
                 ) from e
-            for tx in produced:
-                txns.append(tx)
-                if tx.tx_type is TxType.IGNORED:
-                    report.rows_ignored += 1
-                else:
-                    report.rows_emitted += 1
-
+    _pair_split_rows(path, txns)
+    count_rows(txns, report)
     return txns, report
 
 
-def _parse_row(
-    path: Path, lineno: int, row: dict[str, str], report: ParseReport
-) -> list[Transaction]:
-    action = (row.get("Action") or "").strip()
-    if action not in _ACTION_MAP:
-        # Note: T212 sometimes emits new action variants. Fail loudly.
-        raise ParserError(
-            f"Unknown Trading 212 Action {action!r}",
-            broker=BROKER,
-            source_file=str(path),
-            source_line=lineno,
-        )
-    tx_type = _ACTION_MAP[action]
+def _err(path: Path, lineno: int, msg: str) -> ParserError:
+    return ParserError(msg, broker=BROKER, source_file=str(path), source_line=lineno)
 
-    # Time field is "YYYY-MM-DD HH:MM:SS"
-    raw_time = (row.get("Time") or "").strip()
-    trade_dt = parse_datetime(raw_time) if raw_time else None
-    trade_date = trade_dt.date() if trade_dt else parse_date(row.get("Time", ""))
 
-    isin = (row.get("ISIN") or "").strip() or None
+def _parse_row(path: Path, lineno: int, row: _Row) -> list[Transaction]:
+    action = row.get("Action")
+    time_raw = row.get("Time") or row.get("Time (UTC)")
+    if not time_raw:
+        raise _err(path, lineno, "Row without Time")
+    trade_dt = parse_datetime(time_raw)
+    isin = row.get("ISIN") or None
     if isin and not is_valid_isin(isin):
-        raise ParserError(
-            f"Invalid ISIN: {isin!r}",
-            broker=BROKER,
-            source_file=str(path),
-            source_line=lineno,
-        )
-
-    raw_ref = (row.get("ID") or "").strip() or None
-    ticker = (row.get("Ticker") or "").strip() or None
-    name = (row.get("Name") or "").strip() or None
-    notes = (row.get("Notes") or "").strip() or None
-
+        raise _err(path, lineno, f"Invalid ISIN: {isin!r}")
+    ident = row.get("ID")
+    raw_ref = f"{ident}|{action}|{time_raw}" if ident else None
+    base = {
+        "broker": BROKER,
+        "trade_date": trade_dt.date(),
+        "trade_datetime": trade_dt,
+        "source_file": path.name,
+        "source_line": lineno,
+        "raw_ref": raw_ref,
+        "isin": isin,
+        "symbol": row.get("Ticker") or None,
+        "name": row.get("Name") or None,
+    }
+    broker_note = row.get("Notes") or None
+    total, total_ccy = row.money("Total")
+    acct_ccy = total_ccy or "EUR"
     shares = parse_decimal(row.get("No. of shares"))
     price = parse_decimal(row.get("Price / share"))
-    price_ccy = normalize_currency(row.get("Currency (Price / share)") or "EUR")
-    total = parse_decimal(row.get("Total"))
-    total_ccy = normalize_currency(row.get("Currency (Total)") or "EUR")
-    conv_fee = parse_decimal(row.get("Currency conversion fee") or "0")
-    conv_fee_ccy = normalize_currency(row.get("Currency (Currency conversion fee)") or "EUR")
+    price_ccy = normalize_currency(row.get("Currency (Price / share)") or acct_ccy)
+    rate_raw = row.get("Exchange rate")
 
-    asset_class = asset_class_from_isin(isin)
-    if tx_type in {
-        TxType.DEPOSIT_CASH,
-        TxType.WITHDRAWAL_CASH,
-        TxType.INTEREST,
-        TxType.INTEREST_OTHER,
-        TxType.FEE,
-    }:
-        asset_class = AssetClass.CASH
+    def fx_rate() -> Decimal:
+        if price_ccy == acct_ccy:
+            return Decimal("1")
+        rate = parse_decimal(rate_raw) if rate_raw and rate_raw != "Not available" else ZERO
+        if rate <= 0:
+            raise _err(path, lineno, f"{action}: no exchange rate for {price_ccy}->{acct_ccy}")
+        return rate
 
-    txns: list[Transaction] = []
+    def fees() -> list[Transaction]:
+        out = []
+        for col in _FEE_COLUMNS:
+            amount, ccy = row.money(col)
+            if amount:
+                out.append(make_tx(
+                    base, raw_ref=f"{raw_ref}::{col}" if raw_ref else None,
+                    tx_type=TxType.FEE, asset_class=AssetClass.CASH, quantity=ZERO,
+                    currency_native=ccy or acct_ccy, gross_native=-abs(amount),
+                    notes=f"Trading 212 {col}",
+                ))
+        return out
 
-    if tx_type in {TxType.BUY, TxType.SELL}:
-        # Use price currency as native, so ECB FX applies on the gross.
-        sign = Decimal("-1") if tx_type is TxType.BUY else Decimal("1")
-        gross_native = (sign * shares * price).quantize(Decimal("0.000001"))
-        tx = Transaction(
-            broker=BROKER,
-            trade_date=trade_date,
-            trade_datetime=trade_dt,
-            tx_type=tx_type,
-            asset_class=asset_class,
-            quantity=shares,
-            currency_native=price_ccy,
-            gross_native=gross_native,
-            source_file=path.name,
-            source_line=lineno,
-            raw_ref=raw_ref,
-            isin=isin,
-            symbol=ticker,
-            name=name,
-            price_native=price,
-            fee_native=Decimal("0"),  # T212 charges no per-trade fee; conversion fee handled below
-            notes=notes,
-        )
-        # Audit: store T212's implicit FX in flags
-        broker_fx = parse_decimal(row.get("Exchange rate") or "0")
-        if price_ccy != "EUR" and broker_fx and broker_fx != 1:
-            tx.add_flag(
-                "t212.broker_fx_audit",
-                Severity.INFO,
-                f"Trading 212 implicit fx_rate={broker_fx} {total_ccy}/{price_ccy}; "
-                f"ECB rate will be used for tax math.",
-            )
-        txns.append(tx)
-
-        # Conversion fee (already in EUR) → emit as separate FEE row,
-        # linked via raw_ref + suffix to keep dedup deterministic.
-        if conv_fee and conv_fee != 0:
-            fee_sign = Decimal("-1")  # cost
-            fee_amount = (fee_sign * abs(conv_fee)).quantize(Decimal("0.0001"))
-            txns.append(
-                Transaction(
-                    broker=BROKER,
-                    trade_date=trade_date,
-                    trade_datetime=trade_dt,
-                    tx_type=TxType.FEE,
-                    asset_class=AssetClass.CASH,
-                    quantity=Decimal("0"),
-                    currency_native=conv_fee_ccy,
-                    gross_native=fee_amount,
-                    source_file=path.name,
-                    source_line=lineno,
-                    raw_ref=f"{raw_ref}::convfee" if raw_ref else None,
-                    isin=isin,
-                    name=f"FX conversion fee for {action} {ticker or isin or ''}".strip(),
-                    notes="Trading 212 currency conversion fee",
-                )
-            )
-        return txns
-
-    if tx_type is TxType.SPLIT:
-        # SPLIT rows: shares may carry the new ratio increment. Flag for review.
-        tx = Transaction(
-            broker=BROKER,
-            trade_date=trade_date,
-            trade_datetime=trade_dt,
-            tx_type=TxType.SPLIT,
-            asset_class=asset_class,
-            quantity=shares,
-            currency_native=total_ccy,
-            gross_native=Decimal("0"),
-            source_file=path.name,
-            source_line=lineno,
-            raw_ref=raw_ref,
-            isin=isin,
-            symbol=ticker,
-            name=name,
-            notes=notes,
-            flags=[
-                Flag(
-                    "split_review",
-                    Severity.WARNING,
-                    "Stock split detected; verify pool quantity against post-split position.",
-                )
-            ],
-        )
-        return [tx]
-
-    # Cash-side rows (Deposit, Withdrawal, Interest, Fee, Dividend, Return of capital)
-    free_share = bool(notes and "Free Shares Promotion" in notes) and tx_type is TxType.DEPOSIT_CASH
-    if free_share:
-        # Trading 212 free shares promotions show up as a Deposit *and* an
-        # immediately following Market buy of the same EUR amount. We keep the
-        # Deposit row but flag it for the user.
-        flags = [Flag(
-            "t212.free_share_promo",
-            Severity.WARNING,
-            "Trading 212 free-share promotion: review for Sachbezug treatment.",
+    def conversion(instr_amount: Decimal, label: str) -> list[Transaction]:
+        """T212's automatic conversion between account and instrument currency.
+        ``instr_amount``: signed instrument-currency flow of the conversion."""
+        if price_ccy == acct_ccy or instr_amount == 0:
+            return []
+        acct_amount = -(instr_amount / fx_rate())
+        return [make_tx(
+            base, raw_ref=f"{raw_ref}::fx" if raw_ref else None,
+            tx_type=TxType.FX_CONVERSION, asset_class=AssetClass.CASH, quantity=ZERO,
+            currency_native=price_ccy, gross_native=instr_amount,
+            counter_currency=acct_ccy, counter_amount=acct_amount,
+            notes=f"Trading 212 automatic conversion ({label}) at {rate_raw}",
         )]
-    else:
-        flags = []
 
-    # Per-broker withholding-tax disclosure: Trading 212 CSV exports do NOT
-    # break out the foreign withholding tax separately on dividend rows; the
-    # Total column is already net. Flag this loudly so the user knows the
-    # gross-up + DBA-credit math cannot be performed reliably from this file
-    # alone (they should consult the T212 annual tax report for true gross /
-    # withholding figures).
-    if tx_type is TxType.DIVIDEND_CASH:
-        flags.append(Flag(
-            "t212.missing_withholding_detail",
-            Severity.WARNING,
-            "Trading 212 CSV does not break out withholding tax; gross/credit "
-            "figures cannot be reconstructed from this row alone.",
-        ))
-
-    # Capital return: not taxable as dividend; basis reduction not auto-applied.
-    if tx_type is TxType.RETURN_OF_CAPITAL:
-        flags.append(Flag(
-            "t212.return_of_capital",
-            Severity.WARNING,
-            "Return of capital: excluded from dividend income. Manually reduce "
-            "the position's cost basis if material.",
-        ))
-        # T212 CSVs do not break out foreign withholding on RoC rows; the
-        # Total column may already be net of withholding. The pool engine
-        # reduces cost basis by the reported amount, so a net figure will
-        # under-reduce basis and inflate PnL on the next SELL. Surface the
-        # ambiguity loudly so the user can cross-check against the T212
-        # annual tax report before filing.
-        flags.append(Flag(
-            "t212.roc_net_gross_ambiguous",
-            Severity.WARNING,
-            "T212 may report RoC amount net of foreign withholding; "
-            "cost-basis reduction uses the reported (possibly net) value. "
-            "Verify against T212 annual tax report before relying on it.",
-        ))
-
-    # Source-country hint for foreign withholding tax (used by credit cap).
-    wh_country = country_from_isin(isin) if tx_type is TxType.DIVIDEND_CASH else None
-
-    # T212's Total column is already NET of foreign withholding. Declare the
-    # convention explicitly so the engine's gross-up logic can operate
-    # correctly when a withholding value is supplied (via annual tax report).
-    is_net = True if tx_type is TxType.DIVIDEND_CASH else None
-
-    return [
-        Transaction(
-            broker=BROKER,
-            trade_date=trade_date,
-            trade_datetime=trade_dt,
-            tx_type=tx_type,
-            asset_class=asset_class,
-            quantity=Decimal("0"),
-            currency_native=total_ccy,
-            gross_native=total,
-            source_file=path.name,
-            source_line=lineno,
-            raw_ref=raw_ref,
-            isin=isin,
-            symbol=ticker,
-            name=name,
-            notes=notes,
-            withholding_country=wh_country,
-            dividend_is_net=is_net,
-            flags=flags,
+    if action in _BUYS or action in _SELLS:
+        if not isin or shares <= 0:
+            raise _err(path, lineno, f"{action} without ISIN or shares")
+        is_buy = action in _BUYS
+        gross = shares * price
+        tx = make_tx(
+            base, tx_type=TxType.BUY if is_buy else TxType.SELL,
+            asset_class=asset_class_from_isin(isin), quantity=shares,
+            currency_native=price_ccy, gross_native=-gross if is_buy else gross,
+            price_native=price, notes=broker_note,
         )
-    ]
+        # Buy: account currency → instrument currency first; sell: after.
+        return [tx, *conversion(gross if is_buy else -gross, action), *fees()]
+
+    if action in _DIVIDENDS or action in _DIVIDEND_PIL or action in _DIVIDEND_ROC_LABEL:
+        if not isin:
+            raise _err(path, lineno, f"{action} without ISIN")
+        net = shares * price
+        flags: list[Flag] = []
+        if row.has("Withholding tax"):
+            wht, wht_ccy = row.money("Withholding tax")
+            wht = abs(wht)
+            if wht and wht_ccy not in (None, price_ccy):
+                if wht_ccy != acct_ccy:
+                    raise _err(path, lineno, f"Withholding in unexpected currency {wht_ccy}")
+                wht = wht * fx_rate()
+        else:
+            wht = ZERO
+            flags.append(Flag(FLAG_WHT_NOT_DISCLOSED, Severity.WARNING,
+                              "Export has no 'Withholding tax' column: the gross dividend "
+                              "and the creditable foreign tax are unknown."))
+        if action in _DIVIDEND_PIL:
+            flags.append(Flag(FLAG_PAYMENT_IN_LIEU, Severity.WARNING,
+                              "Manufactured dividend (securities lending): foreign tax is "
+                              "not credited automatically."))
+        if action in _DIVIDEND_ROC_LABEL:
+            flags.append(Flag(FLAG_ROC_LABEL, Severity.WARNING,
+                              f"'{action}': taxed as a dividend unless an "
+                              "Einlagenrückzahlung is proven (rules/return_of_capital.yaml)."))
+        tx = make_tx(
+            base, tx_type=TxType.DIVIDEND_CASH, asset_class=asset_class_from_isin(isin),
+            quantity=ZERO, currency_native=price_ccy, gross_native=net + wht,
+            tax_withheld_native=wht, dividend_is_net=False,
+            withholding_country=country_from_isin(isin), flags=flags,
+        )
+        return [tx, *conversion(-net, action)]
+
+    if action == "Deposit":
+        promo = "Free Shares Promotion" in (row.get("Notes") or "")
+        tx_type = TxType.PROMO_BONUS if promo else TxType.DEPOSIT_CASH
+        return [make_tx(base, tx_type=tx_type, asset_class=AssetClass.CASH, quantity=ZERO,
+                            currency_native=acct_ccy, gross_native=total, notes=broker_note),
+                *fees()]
+    simple: dict[str, TxType] = {
+        "Withdrawal": TxType.WITHDRAWAL_CASH,
+        "Interest on cash": TxType.INTEREST,  # T212 is no credit institution → 27,5 %
+        "Lending interest": TxType.INTEREST_OTHER,
+        "Spending cashback": TxType.CASHBACK,
+        "Card cashback": TxType.CASHBACK,
+    }
+    if action in simple:
+        return [make_tx(base, tx_type=simple[action], asset_class=AssetClass.CASH,
+                            quantity=ZERO, currency_native=acct_ccy, gross_native=total,
+                            notes=broker_note)]
+    if action in _CARD:
+        return [make_tx(base, tx_type=TxType.IGNORED, asset_class=AssetClass.CASH,
+                            quantity=ZERO, currency_native=acct_ccy, gross_native=total)]
+    if action == "Result adjustment":
+        tx = make_tx(base, tx_type=TxType.FEE, asset_class=AssetClass.CASH,
+                         quantity=ZERO, currency_native=acct_ccy, gross_native=total)
+        tx.add_flag("t212.result_adjustment", Severity.WARNING,
+                    "Result adjustment (broker correction/compensation): no tax effect "
+                    "assumed — verify.")
+        return [tx]
+    if action == "Currency conversion":
+        from_amt, from_ccy = row.money("Currency conversion from amount")
+        to_amt, to_ccy = row.money("Currency conversion to amount")
+        if not from_ccy or not to_ccy:
+            raise _err(path, lineno, "Currency conversion without from/to amount columns")
+        return [make_tx(
+            base, tx_type=TxType.FX_CONVERSION, asset_class=AssetClass.CASH, quantity=ZERO,
+            currency_native=to_ccy, gross_native=abs(to_amt),
+            counter_currency=from_ccy, counter_amount=-abs(from_amt),
+        ), *fees()]
+    if action in {"Stock split open", "Stock split close"}:
+        if not isin:
+            raise _err(path, lineno, f"{action} without ISIN")
+        return [make_tx(base, tx_type=TxType.IGNORED, asset_class=asset_class_from_isin(isin),
+                            quantity=shares, currency_native=price_ccy, gross_native=ZERO,
+                            price_native=price, link_id=action)]
+    if action in {"Spin off", "Stock distribution", "Custom stock distribution"}:
+        if not isin or shares <= 0:
+            raise _err(path, lineno, f"{action} without ISIN or shares")
+        tx = make_tx(base, tx_type=TxType.SPLIT, asset_class=asset_class_from_isin(isin),
+                         quantity=shares, currency_native=price_ccy, gross_native=ZERO,
+                         price_native=price)
+        tx.add_flag("corporate_action.distribution", Severity.WARNING,
+                    f"{action}: treated as a tax-neutral split if the security is already "
+                    "held; otherwise a declaration (spin-off basis split or taxable "
+                    "distribution) is required.")
+        return [tx]
+    if action in {"Transfer in", "Transfer out"}:
+        if not isin or shares <= 0:
+            raise _err(path, lineno, f"{action} without ISIN or shares")
+        return [make_tx(
+            base,
+            tx_type=TxType.MIGRATION_IN if action == "Transfer in" else TxType.MIGRATION_OUT,
+            asset_class=asset_class_from_isin(isin), quantity=shares,
+            currency_native=price_ccy, gross_native=ZERO, price_native=price or None,
+        )]
+    raise _err(path, lineno, f"Unknown or unsupported Trading 212 Action {action!r}")
+
+
+def _pair_split_rows(path: Path, txns: list[Transaction]) -> None:
+    """``Stock split close`` (position before) + ``Stock split open`` (position
+    after) at the same timestamp → one SPLIT delta (or an exchange if the ISIN
+    changed)."""
+    groups: dict[object, list[Transaction]] = defaultdict(list)
+    for t in txns:
+        if t.link_id in {"Stock split open", "Stock split close"}:
+            groups[t.trade_datetime].append(t)
+    for _ts, legs in groups.items():
+        closes = [t for t in legs if t.link_id == "Stock split close"]
+        opens = [t for t in legs if t.link_id == "Stock split open"]
+        if len(closes) != 1 or len(opens) != 1:
+            raise _err(path, legs[0].source_line,
+                       "Stock split rows must come as one close/open pair per timestamp")
+        c, o = closes[0], opens[0]
+        c.link_id = o.link_id = None
+        if c.isin == o.isin:
+            o.tx_type, o.quantity = TxType.SPLIT, o.quantity - c.quantity
+            c.notes = f"Split close leg (merged into {o.source_file}:{o.source_line})"
+        else:
+            link = f"t212-split:{c.isin}->{o.isin}:{o.trade_datetime}"
+            c.tx_type, c.link_id = TxType.EXCHANGE_OUT, link
+            o.tx_type, o.link_id = TxType.EXCHANGE_IN, link

@@ -1,34 +1,37 @@
-"""Trade Republic CSV parser.
+"""Trade Republic transaction CSV parser (in-app "Transaktionsexport").
 
-Format (comma-separated, all fields quoted):
-    datetime, date, account_type, category, type, asset_class, name, symbol,
-    shares, price, amount, fee, tax, currency, original_amount,
-    original_currency, fx_rate, description, transaction_id, counterparty_name,
-    counterparty_iban, payment_reference, mcc_code
+Columns (all quoted): datetime, date, account_type, category, type,
+asset_class, name, symbol (= ISIN), shares, price, amount, fee, tax, currency,
+original_amount, original_currency, fx_rate, description, transaction_id, …
 
-We **enforce a hard cutoff** for trade dates >= broker's ``steuereinfach_from``
-to avoid double-taxing transactions that TR will report to the AT
-Finanzbehörde directly.
+Semantics (net cash = amount + fee + tax; fee/tax are signed):
 
-Categories ``CASH``/``TRADING`` matter; others are filtered.
-Card transactions, SEPA inbound/outbound, card-ordering fees etc. are not
-tax-relevant capital-income events but are kept as IGNORED for audit.
+* BUY/SELL: ``amount`` = −shares × price (excl. fee; bonds incl. accrued
+  interest, which belongs to cost/proceeds); SELL ``shares`` negative.
+* DIVIDEND/DISTRIBUTION: ``amount`` is the GROSS dividend in EUR, ``tax``
+  (negative) the tax withheld. For foreign-currency dividends
+  ``original_amount``/``original_currency`` hold the gross in the payment
+  currency, which is valued at the ECB rate (EStR Rz 6201c); TR's conversion
+  into EUR is booked as an ``FX_CONVERSION`` at TR's rate.
+* STOCKPERK (card reward in shares of the merchant) and BENEFITS_SAVEBACK
+  (1 % of card spending invested) are card cashback — capital income at
+  receipt (EStR Rz 6134; 25 % as TR is a credit institution). The cash row
+  carries the value; the shares are bought by a separate BUY at full cost.
+* MIGRATION: direction is the sign of ``shares`` (``amount`` is empty).
+
+The account's steuereinfach cutoff is applied by :func:`parsers.parse_file`.
 """
 
 from __future__ import annotations
 
 import csv
-from datetime import date as DateT
 from decimal import Decimal
 from pathlib import Path
 
 from ..model import (
     AssetClass,
-    CutoffViolationError,
-    Flag,
-    FxSource,
-    ParserError,
     ParseReport,
+    ParserError,
     Severity,
     Transaction,
     TxType,
@@ -41,326 +44,190 @@ from ..normalize import (
     parse_datetime,
     parse_decimal,
 )
-from .base import asset_class_from_isin, file_sha256
+from .base import asset_class_from_isin, count_rows, file_sha256, make_tx
 
 BROKER = "trade_republic"
+ZERO = Decimal("0")
 
-# Map TR `type` (within TRADING/CASH categories) to canonical TxType.
-# None means "not tax-relevant — keep as IGNORED".
-_TYPE_MAP: dict[str, TxType | None] = {
-    "BUY": TxType.BUY,
-    "SELL": TxType.SELL,
-    "DIVIDEND": TxType.DIVIDEND_CASH,
+_CASH_TYPES: dict[str, TxType] = {
+    # Trade Republic Bank GmbH is a credit institution → 25 % via broker config.
     "INTEREST_PAYMENT": TxType.INTEREST,
-    "STOCKPERK": TxType.BONUS_SHARE,
-    "BENEFITS_SAVEBACK": TxType.BONUS_SHARE,
+    "BENEFITS_SAVEBACK": TxType.CASHBACK,
     "CUSTOMER_INBOUND": TxType.DEPOSIT_CASH,
+    "CUSTOMER_INPAYMENT": TxType.DEPOSIT_CASH,
+    "TRANSFER_INBOUND": TxType.DEPOSIT_CASH,
+    "TRANSFER_INSTANT_INBOUND": TxType.DEPOSIT_CASH,
     "CUSTOMER_OUTBOUND_REQUEST": TxType.WITHDRAWAL_CASH,
-    "GIFT": TxType.DEPOSIT_CASH,  # promotional cash gift / referral bonus
-    "CARD_TRANSACTION": None,
-    "CARD_TRANSACTION_INTERNATIONAL": None,
-    "CARD_ORDERING_FEE": None,
-    "CARD_REFUND": None,
-    "CARD_REPAYMENT": None,
-    "MIGRATION_OUT": TxType.MIGRATION_OUT,
-    "MIGRATION_IN": TxType.MIGRATION_IN,
-    "MIGRATION": TxType.MIGRATION_OUT,  # sign of amount disambiguates
+    "TRANSFER_OUTBOUND": TxType.WITHDRAWAL_CASH,
+    "TRANSFER_INSTANT_OUTBOUND": TxType.WITHDRAWAL_CASH,
+}
+_IGNORED_TYPES = {
+    "CARD_TRANSACTION",
+    "CARD_TRANSACTION_INTERNATIONAL",
+    "CARD_ORDERING_FEE",
+    "CARD_REFUND",
+    "CARD_REPAYMENT",
+    "CARD_TRANSACTION_REFUND",
 }
 
 
-def parse(
-    path: Path,
-    *,
-    steuereinfach_from: DateT | None = None,
-    strict_cutoff: bool = False,
-) -> tuple[list[Transaction], ParseReport]:
-    """Parse a Trade Republic CSV export.
-
-    Rows with ``trade_date >= steuereinfach_from`` are tax-handled by TR
-    directly. By default they are emitted as ``TxType.IGNORED`` with a
-    WARNING flag and counted in ``rows_rejected`` so the user sees them
-    in the audit but they never affect tax math. Set ``strict_cutoff=True``
-    to instead raise :class:`CutoffViolationError` on the first such row.
-    """
+def parse(path: Path) -> tuple[list[Transaction], ParseReport]:
     report = ParseReport(broker=BROKER, source_file=str(path), file_sha256=file_sha256(path))
     txns: list[Transaction] = []
-
     with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for lineno, row in enumerate(reader, start=2):
+        for lineno, row in enumerate(csv.DictReader(f), start=2):
             report.rows_total += 1
             try:
-                tx = _parse_row(
-                    path, lineno, row, report, steuereinfach_from, strict_cutoff
-                )
-            except CutoffViolationError:
+                txns.extend(_parse_row(path, lineno, row, report))
+            except ParserError:
                 raise
-            except (ParserError, ValueError) as e:
-                if isinstance(e, ParserError):
-                    raise
+            except (ValueError, ArithmeticError) as e:
                 raise ParserError(
-                    str(e),
-                    broker=BROKER,
-                    source_file=str(path),
-                    source_line=lineno,
+                    str(e), broker=BROKER, source_file=str(path), source_line=lineno,
                     raw=",".join(f"{k}={v}" for k, v in row.items()),
                 ) from e
-            if tx is None:
-                continue
-            txns.append(tx)
-            if tx.tx_type is TxType.IGNORED:
-                report.rows_ignored += 1
-            else:
-                report.rows_emitted += 1
-
-    _repair_stockperk_paired_buy(txns)
+    count_rows(txns, report)
     return txns, report
 
 
-def _repair_stockperk_paired_buy(txns: list[Transaction]) -> None:
-    """Rewrite the BUY that materializes a Stockperk gift as a zero-cost lot.
-
-    Trade Republic books a promotional free share as two CSV rows:
-      1. STOCKPERK (category=CASH, no shares, amount = EUR FMV of the gift).
-      2. BUY       (category=TRADING, shares=<fractional>, amount=-EUR FMV).
-
-    Parsed naively this (a) adds real cost basis = FMV to the pool via the
-    BUY, (b) surfaces no income for the gift, and (c) leaves the later
-    SELL over-reporting nothing but also never reporting the gift as
-    income. The pragmatic AT treatment for broker-native Stockperks is a
-    zero-cost lot (no receipt income, full proceeds taxable at sale).
-
-    This post-processor finds each tagged STOCKPERK row and, for the
-    first BUY on the same ISIN within a 3-day window whose gross value
-    matches the Stockperk FMV to the cent, rewrites the BUY to
-    BONUS_SHARE with zero gross. Unpaired Stockperks stay untouched
-    (defensive — a genuine shares-bearing STOCKPERK row is already a
-    zero-cost BONUS_SHARE on its own).
-    """
-    TOL = Decimal("0.01")
-    stockperks = [
-        t for t in txns
-        if any(f.code == "tr.stockperk" for f in t.flags)
-        and t.quantity == 0
-        and t.gross_native > 0
-        and t.isin
-    ]
-    if not stockperks:
-        return
-    for sp in stockperks:
-        match: Transaction | None = None
-        for tx in txns:
-            if tx is sp:
-                continue
-            if tx.tx_type is not TxType.BUY:
-                continue
-            if tx.isin != sp.isin:
-                continue
-            delta_days = abs((tx.trade_date - sp.trade_date).days)
-            if delta_days > 3:
-                continue
-            if (abs(tx.gross_native) - sp.gross_native).copy_abs() > TOL:
-                continue
-            match = tx
-            break
-        if match is None:
-            continue
-        match.tx_type = TxType.BONUS_SHARE
-        match.gross_native = Decimal("0")
-        match.price_native = None
-        match.notes = (
-            "Trade Republic Stockperk: converted paired BUY into zero-cost "
-            "BONUS_SHARE. FMV of the gift is NOT booked as cost basis."
-        )
-        match.add_flag(
-            "tr.stockperk_paired_buy",
-            Severity.INFO,
-            f"Paired with Stockperk row {sp.source_file}:{sp.source_line}; "
-            "basis set to 0 (Nullkostenzuwendung).",
-        )
-        sp.add_flag(
-            "tr.stockperk_paired",
-            Severity.INFO,
-            f"Paired BUY row {match.source_file}:{match.source_line} "
-            "rewritten to zero-cost BONUS_SHARE.",
-        )
-
-
 def _parse_row(
-    path: Path,
-    lineno: int,
-    row: dict[str, str],
-    report: ParseReport,
-    cutoff: DateT | None,
-    strict_cutoff: bool,
-) -> Transaction | None:
-    raw_type = (row.get("type") or "").strip().upper()
-    category = (row.get("category") or "").strip().upper()
-    trade_date = parse_date(row["date"])
-    if cutoff is not None and trade_date >= cutoff:
-        if strict_cutoff:
-            raise CutoffViolationError(
-                f"Trade Republic became steuereinfach on {cutoff}; "
-                f"row at {path.name}:{lineno} has trade_date {trade_date}. "
-                f"Re-export TR data with date <= {cutoff - _ONE_DAY}, or remove that row."
-            )
-        # Non-strict: emit a stub IGNORED row so the user sees it in the audit
-        # tab, count it as rejected, and add a WARNING flag at report level.
-        report.rows_rejected += 1
-        if not any(f.code == "tr.post_cutoff" for f in report.flags):
-            report.flags.append(
-                Flag(
-                    "tr.post_cutoff",
-                    Severity.WARNING,
-                    f"Rows on/after {cutoff} are TR-steuereinfach and excluded from tax math.",
-                )
-            )
-        return Transaction(
-            broker=BROKER,
-            trade_date=trade_date,
-            tx_type=TxType.IGNORED,
-            asset_class=AssetClass.OTHER,
-            quantity=Decimal("0"),
-            currency_native=normalize_currency(row.get("currency")),
-            gross_native=parse_decimal(row.get("amount")),
-            source_file=path.name,
-            source_line=lineno,
-            raw_ref=(row.get("transaction_id") or "").strip() or None,
-            notes=f"Post-cutoff TR row ({raw_type}/{category}) — handled by TR steuereinfach",
-            flags=[Flag("tr.post_cutoff", Severity.WARNING, "Excluded: TR steuereinfach.")],
-        )
+    path: Path, lineno: int, row: dict[str, str], report: ParseReport
+) -> list[Transaction]:
+    def get(key: str) -> str:
+        return (row.get(key) or "").strip()
 
-    isin = (row.get("symbol") or "").strip() or None
-    # TR's "symbol" is actually the ISIN for securities.
+    def err(msg: str) -> ParserError:
+        return ParserError(msg, broker=BROKER, source_file=str(path), source_line=lineno)
+
+    raw_type = get("type").upper()
+    category = get("category").upper()
+    isin = get("symbol") or None
     if isin and not is_valid_isin(isin):
-        # Some bonds may not validate cleanly — accept but flag.
-        flag = Flag("tr.isin_invalid", Severity.WARNING, f"ISIN failed checksum: {isin!r}")
-    else:
-        flag = None
-
-    currency = normalize_currency(row.get("currency"))
-    trade_dt = None
-    if dtv := row.get("datetime"):
-        try:
-            trade_dt = parse_datetime(dtv)
-        except ValueError:
-            trade_dt = None
-
-    shares = parse_decimal(row.get("shares"))
-    # TR encodes sell quantities as negative; we want absolute quantity in canonical model.
-    quantity = abs(shares)
-    price = parse_decimal(row.get("price"))
-    amount = parse_decimal(row.get("amount"))
-    fee = parse_decimal(row.get("fee"))
-    tax = parse_decimal(row.get("tax"))
-    raw_ref = (row.get("transaction_id") or "").strip() or None
-    name = (row.get("name") or "").strip() or None
-    asset_hint = (row.get("asset_class") or "").strip()
-
-    # Determine canonical type
-    if raw_type not in _TYPE_MAP:
-        raise ParserError(
-            f"Unknown Trade Republic type {raw_type!r} (category={category})",
-            broker=BROKER,
-            source_file=str(path),
-            source_line=lineno,
-        )
-    mapped = _TYPE_MAP[raw_type]
-    if mapped is None:
-        # Card and similar — store as IGNORED for audit
-        report.rows_rejected += 1
-        return Transaction(
-            broker=BROKER,
-            trade_date=trade_date,
-            trade_datetime=trade_dt,
-            tx_type=TxType.IGNORED,
-            asset_class=AssetClass.CASH,
-            quantity=Decimal("0"),
-            currency_native=currency,
-            gross_native=amount,
-            source_file=path.name,
-            source_line=lineno,
-            raw_ref=raw_ref,
-            isin=isin,
-            name=name,
-            fee_native=fee,
-            tax_withheld_native=tax,
-            notes=f"TR {raw_type}",
-        )
-
-    tx_type = mapped
-    # Disambiguate MIGRATION based on amount sign
-    if raw_type == "MIGRATION":
-        tx_type = TxType.MIGRATION_OUT if amount < 0 else TxType.MIGRATION_IN
-
-    asset_class = asset_class_from_isin(isin, asset_hint)
-    if tx_type in {
-        TxType.INTEREST,
-        TxType.INTEREST_OTHER,
-        TxType.DEPOSIT_CASH,
-        TxType.WITHDRAWAL_CASH,
-        TxType.FEE,
-    }:
-        asset_class = AssetClass.CASH
-
-    # Capture broker-supplied FX rate for audit, not for tax math.
-    broker_fx = parse_decimal(row.get("fx_rate"))
-    notes = None
-    if broker_fx > 0 and currency != "EUR":
-        notes = f"broker_fx_rate={broker_fx}"
-
-    tx = Transaction(
-        broker=BROKER,
-        trade_date=trade_date,
-        trade_datetime=trade_dt,
-        tx_type=tx_type,
-        asset_class=asset_class,
-        quantity=quantity if tx_type in {TxType.BUY, TxType.SELL, TxType.BONUS_SHARE} else Decimal("0"),
-        currency_native=currency,
-        gross_native=amount,
-        source_file=path.name,
-        source_line=lineno,
-        raw_ref=raw_ref,
-        isin=isin,
-        symbol=(row.get("symbol") or "").strip() or None,
-        name=name,
-        price_native=price if price != 0 else None,
-        fee_native=fee,
-        tax_withheld_native=tax,
-        notes=notes,
+        raise err(f"Invalid ISIN: {isin!r}")
+    shares = parse_decimal(get("shares"))
+    amount = parse_decimal(get("amount"))
+    fee = parse_decimal(get("fee"))  # negative = cost
+    tax = parse_decimal(get("tax"))  # negative = withheld / paid
+    base = {
+        "broker": BROKER,
+        "trade_date": parse_date(get("date")),
+        "trade_datetime": parse_datetime(get("datetime")) if get("datetime") else None,
+        "currency_native": normalize_currency(get("currency")),
+        "source_file": path.name,
+        "source_line": lineno,
+        "raw_ref": get("transaction_id") or None,
+        "isin": isin,
+        "symbol": isin,
+        "name": get("name") or None,
+    }
+    asset_class = asset_class_from_isin(isin, get("asset_class") or None) if isin else (
+        AssetClass.CASH
     )
-    if flag:
-        tx.flags.append(flag)
-    if raw_type == "STOCKPERK":
-        # Tag so the post-processor can pair this BONUS_SHARE with the
-        # subsequent BUY that records the promotional shares as if the user
-        # had paid for them. The paired BUY is rewritten to a zero-cost
-        # BONUS_SHARE (§ 27 Abs. 3 EStG — zero Anschaffungskosten for a
-        # Nullkostenzuwendung) so the later SELL's basis is not inflated by
-        # the gift value.
-        tx.add_flag(
-            "tr.stockperk",
-            Severity.INFO,
-            "Trade Republic Stockperk promotional gift (pool-side repair).",
+
+    if raw_type in {"BUY", "SELL"}:
+        if not isin or shares == 0:
+            raise err(f"{raw_type} without ISIN or shares")
+        tx = make_tx(
+            base, tx_type=TxType.BUY if raw_type == "BUY" else TxType.SELL,
+            asset_class=asset_class, quantity=abs(shares), gross_native=amount,
+            price_native=parse_decimal(get("price")) or None, fee_native=-fee - tax,
         )
-    if tx_type is TxType.DIVIDEND_CASH:
-        # TR reports the NET cash amount in `amount` after foreign withholding;
-        # the `tax` field holds the withheld portion separately.
-        tx.dividend_is_net = True
-        tx.withholding_country = country_from_isin(isin)
-    if tx_type is TxType.BONUS_SHARE:
-        # Broker-native promo gifts (Stockperk / Saveback) are treated as
-        # zero-cost shares by default. Only non-broker sources are flagged.
-        if raw_type not in {"STOCKPERK", "BENEFITS_SAVEBACK"}:
-            tx.add_flag(
-                "bonus_share_non_broker_source",
-                Severity.WARNING,
-                "Bonus share is not marked as broker-native promotion; review source/tax treatment.",
+        if tax:
+            tx.add_flag("tr.transaction_tax", Severity.INFO,
+                        f"tax {tax} on a trade treated as a non-deductible cost.")
+        return [tx]
+
+    if raw_type in {"DIVIDEND", "DISTRIBUTION", "DIVIDEND_EQUIVALENT_PAYMENT"}:
+        if not isin:
+            raise err(f"{raw_type} without ISIN")
+        withheld_eur = -tax
+        orig_ccy = get("original_currency")
+        out: list[Transaction] = []
+        if orig_ccy and normalize_currency(orig_ccy) != base["currency_native"]:
+            fx = parse_decimal(get("fx_rate"))  # EUR per unit of orig_ccy
+            if fx <= 0:
+                raise err("Foreign-currency dividend without fx_rate")
+            ccy = normalize_currency(orig_ccy)
+            gross = parse_decimal(get("original_amount"))
+            withheld = withheld_eur / fx
+            net_orig = gross - withheld
+            dividend = make_tx(base, currency_native=ccy, tx_type=TxType.DIVIDEND_CASH,
+                asset_class=asset_class, quantity=ZERO, gross_native=gross,
+                tax_withheld_native=withheld, dividend_is_net=False,
+                withholding_country=country_from_isin(isin),
             )
-    return tx
+            out.append(dividend)
+            ref = f"{base['raw_ref']}::fx" if base["raw_ref"] else None
+            out.append(make_tx(
+                base, currency_native=ccy, raw_ref=ref, tx_type=TxType.FX_CONVERSION,
+                asset_class=AssetClass.CASH, quantity=ZERO,
+                gross_native=-net_orig, counter_currency=base["currency_native"],
+                counter_amount=amount + tax, notes=f"TR conversion at {fx}",
+            ))
+        else:
+            dividend = make_tx(
+                base, tx_type=TxType.DIVIDEND_CASH, asset_class=asset_class, quantity=ZERO,
+                gross_native=amount, tax_withheld_native=withheld_eur, dividend_is_net=False,
+                withholding_country=country_from_isin(isin),
+            )
+            out.append(dividend)
+        if raw_type == "DIVIDEND_EQUIVALENT_PAYMENT":
+            from ..model import FLAG_ROC_LABEL
 
+            dividend.add_flag(FLAG_ROC_LABEL, Severity.WARNING,
+                              "'Capital distribution': taxed as a dividend unless an "
+                              "Einlagenrückzahlung is proven (rules/return_of_capital.yaml).")
+        return out
 
-# Local import to avoid pulling in datetime everywhere
-from datetime import timedelta as _td  # noqa: E402
+    if raw_type == "STOCKPERK":
+        if shares:
+            # Shares delivered directly: income at market value = basis.
+            return [make_tx(base, tx_type=TxType.BONUS_SHARE, asset_class=asset_class,
+                                quantity=abs(shares), gross_native=amount)]
+        return [make_tx(base, isin=None, tx_type=TxType.CASHBACK,
+                            asset_class=AssetClass.CASH, quantity=ZERO, gross_native=amount,
+                            notes=f"Stockperk for {isin} (shares bought by a separate BUY)")]
 
-_ONE_DAY = _td(days=1)
+    if raw_type == "BENEFITS_SAVEBACK":
+        if shares:
+            raise err("Saveback row with shares: format not verified")
+        return [make_tx(base, isin=None, tx_type=TxType.CASHBACK,
+                            asset_class=AssetClass.CASH, quantity=ZERO, gross_native=amount,
+                            notes=f"Saveback for {isin} (shares bought by a separate BUY)")]
+
+    if raw_type == "GIFT":
+        # Private gift between users (send/receive), not income.
+        return [make_tx(base, tx_type=TxType.DEPOSIT_CASH if amount >= 0
+                            else TxType.WITHDRAWAL_CASH, asset_class=AssetClass.CASH,
+                            quantity=ZERO, gross_native=amount)]
+
+    if raw_type == "MIGRATION":
+        if not isin or shares == 0:
+            raise err("MIGRATION without ISIN or shares")
+        return [make_tx(
+            base, tx_type=TxType.MIGRATION_IN if shares > 0 else TxType.MIGRATION_OUT,
+            asset_class=asset_class, quantity=abs(shares), gross_native=ZERO,
+            price_native=parse_decimal(get("price")) or None,
+        )]
+
+    if raw_type == "SPLIT" and category == "CORPORATE_ACTION":
+        if not isin or shares == 0:
+            raise err("SPLIT without ISIN or shares")
+        return [make_tx(base, tx_type=TxType.SPLIT, asset_class=asset_class,
+                            quantity=shares, gross_native=ZERO)]
+
+    if raw_type in _CASH_TYPES:
+        tx = make_tx(base, isin=None, tx_type=_CASH_TYPES[raw_type],
+                         asset_class=AssetClass.CASH, quantity=ZERO, gross_native=amount)
+        if tax and raw_type == "INTEREST_PAYMENT":
+            tx.tax_withheld_native = -tax
+            tx.dividend_is_net = False
+        return [tx]
+
+    if raw_type in _IGNORED_TYPES:
+        report.rows_rejected += 1
+        return [make_tx(base, isin=None, tx_type=TxType.IGNORED,
+                            asset_class=AssetClass.CASH, quantity=ZERO, gross_native=amount,
+                            notes=f"TR {raw_type}")]
+
+    raise err(f"Unknown or unsupported Trade Republic type {raw_type!r} (category={category})")

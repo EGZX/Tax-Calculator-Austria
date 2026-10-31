@@ -1,56 +1,68 @@
 """Aggregate transactions into E1kv Kennzahl totals for a tax year.
 
-Inputs:
-  * Year-filtered list of canonical transactions (already ECB-converted).
-  * Realized-gain events from :class:`PoolManager`.
-  * :class:`TaxRules` for the year.
+Inputs: year-filtered canonical transactions (ECB-converted), realized events
+from :class:`PoolManager`, the year's :class:`TaxRules` and the broker config.
 
-Output:
-  * :class:`E1kvReport` with per-Kennzahl totals, per-row contributions for
-    drill-down, and a :class:`ReportHealth` record listing any blockers or
-    warnings that affect whether the report is safe to file.
+Reporting follows the BMF form (Beilage E 1kv, Anm 19/22; EStR Rz 7752h):
+
+* Gains and losses are reported separately and gross. The Finanzamt nets all
+  section 1.3 Kennzahlen; the engine never moves amounts between Kennzahlen.
+* Creditable foreign tax per income item = min(withheld, DBA residual rate ×
+  gross, Austrian rate × gross). Tax above the DBA rate is refundable abroad
+  only and is reported separately, never in KZ 998/901.
+* Income consumed by the loss offset loses its credit. The taxpayer may pick
+  the offset order (EStR Rz 7752h; Anm 19 2025); 27,5 % Überschüsse are used
+  first (Anm 19), then income without creditable tax, then income with the
+  lowest credit ratio, then 25 % Überschüsse — which preserves the most credit.
+* The credit is capped per source country at the Austrian tax on that
+  country's income left after the offset (Anrechnungshöchstbetrag).
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_EVEN
-from typing import Iterable
+from datetime import date
+from decimal import ROUND_HALF_EVEN, Decimal
 
 from ..model import (
+    FLAG_CA_UNCLASSIFIED,
+    FLAG_PAYMENT_IN_LIEU,
+    FLAG_WHT_COUNTRY_UNCERTAIN,
+    FLAG_WHT_NOT_DISCLOSED,
     AssetClass,
     FxSource,
     ReportNotFileableError,
+    Severity,
     Transaction,
     TxType,
 )
 from ..normalize import isin_looks_like_fund
 from ..parsers.base import asset_class_override_for
 from ..pool import PoolManager, RealizedEvent
-from .rules import Kennzahl, TaxRules
+from .rules import BrokersConfig, BucketKind, Kennzahl, TaxRules
 
 EUR_Q = Decimal("0.01")
-MAX_CREDITABLE_WITHHOLDING_CAP = Decimal("0.15")
+ZERO = Decimal("0")
+
+# Flag codes that withhold the treaty credit pending manual review.
+_NO_CREDIT_FLAGS = {
+    FLAG_PAYMENT_IN_LIEU: "substitute payment (securities lending), not a "
+    "dividend under the DBA — credit only after manual review (EAS 3008)",
+}
+
+_DIVIDEND_TYPES = {TxType.DIVIDEND_CASH, TxType.DIVIDEND_STOCK}
+# Austrian KESt on dividends of Austrian companies is withheld by the issuer
+# even for shares in a foreign depot (§ 95 Abs 2 Z 1 lit a EStG); such
+# dividends are final-taxed (§ 97) and not part of the foreign columns.
+_KEST_RATE = Decimal("0.275")
+_KEST_TOLERANCE = Decimal("0.005")
+_INTEREST_TYPES = {TxType.INTEREST, TxType.INTEREST_OTHER}
 
 
 def _q(d: Decimal) -> Decimal:
     return d.quantize(EUR_Q, rounding=ROUND_HALF_EVEN)
-
-
-def _realized_bucket_for_pnl(rules: TaxRules, base_bucket: str, pnl: Decimal) -> str:
-    """Return effective realized bucket, optionally split by sign.
-
-    When yearly rules define separate gain/loss buckets for realized
-    Wertsteigerungen, route positive/zero PnL to the gain bucket and negative
-    PnL to the loss bucket.
-    """
-    if base_bucket != "einkuenfte_realisierte_wertsteigerungen_27_5":
-        return base_bucket
-    gain_bucket = "einkuenfte_realisierte_wertsteigerungen_27_5_gewinne"
-    loss_bucket = "einkuenfte_realisierte_wertsteigerungen_27_5_verluste"
-    if gain_bucket in rules.kennzahlen and loss_bucket in rules.kennzahlen:
-        return loss_bucket if pnl < 0 else gain_bucket
-    return base_bucket
 
 
 @dataclass
@@ -63,13 +75,16 @@ class Contribution:
     name: str | None
     amount_eur: Decimal
     note: str = ""
+    withheld_eur: Decimal = ZERO
+    creditable_eur: Decimal = ZERO
+    country: str | None = None
 
 
 @dataclass
 class BucketResult:
     bucket: str
     kennzahl: Kennzahl
-    total_eur: Decimal = Decimal("0")
+    total_eur: Decimal = ZERO
     contributions: list[Contribution] = field(default_factory=list)
 
 
@@ -77,18 +92,13 @@ class BucketResult:
 class ReportHealth:
     """Gatekeeper for whether the report is safe to file.
 
-    ``blockers`` must be empty for ``fileable`` to be True. Callers who
-    produce final filing numbers (scripts, export jobs) should check
-    ``fileable`` or call :meth:`E1kvReport.by_kennzahl` without
-    ``allow_partial=True``, which raises if blockers exist.
-
-    ``warnings`` are non-blocking but must be surfaced in the UI / any
-    generated PDF so the user acknowledges them.
+    ``blockers`` must be empty for ``fileable``. ``warnings`` are
+    non-blocking but must be shown to the user.
     """
 
     blockers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    excluded_isins: list[tuple[str, str, str]] = field(default_factory=list)
+    excluded_isins: list[tuple[str, str, str, date]] = field(default_factory=list)
 
     @property
     def fileable(self) -> bool:
@@ -96,32 +106,36 @@ class ReportHealth:
 
 
 @dataclass
+class LossOffsetSummary:
+    """Informational simulation of the Finanzamt's Verlustausgleich."""
+
+    losses_eur: Decimal = ZERO  # total losses to offset (positive)
+    absorbed_eur: Decimal = ZERO
+    unabsorbed_eur: Decimal = ZERO  # lost: no carry-forward (§ 27 Abs 8)
+    saldo_1_3_eur: Decimal = ZERO  # "Saldo aus Punkt 1.3"
+
+
+@dataclass
 class E1kvReport:
     year: int
     buckets: dict[str, BucketResult] = field(default_factory=dict)
-    # Withholding-tax credit (per bucket)
+    # Creditable foreign tax per credit bucket, after loss offset.
     creditable_withholding: dict[str, Decimal] = field(default_factory=dict)
-    # Excess foreign withholding above the DBA cap (per bucket). Informational
-    # only: cannot be credited against Austrian KESt, but the user may be
-    # able to reclaim it from the source state (Form 85, CH / 5000, FR / …).
+    # Withheld above the DBA rate: NOT creditable, refundable abroad only.
     uncreditable_withholding: dict[str, Decimal] = field(default_factory=dict)
-    # Loss-offset summary (informational)
+    # Credit forfeited because the income was consumed by the loss offset.
+    credit_lost_to_loss_offset: dict[str, Decimal] = field(default_factory=dict)
+    loss_offset: LossOffsetSummary = field(default_factory=LossOffsetSummary)
     loss_offset_note: str = ""
-    # Gatekeeper: blockers / warnings that affect whether this report may be
-    # filed. Populated by ``build_report``.
     health: ReportHealth = field(default_factory=ReportHealth)
+    # Filled by build_report so by_kennzahl can resolve credit bucket → KZ.
+    credit_kennzahlen: dict[str, Kennzahl] = field(default_factory=dict)
 
     def by_kennzahl(self, *, allow_partial: bool = False) -> dict[int, Decimal]:
-        """All non-zero E1kv Kennzahl totals.
+        """All non-zero Kennzahl totals, including the credit Kennzahlen.
 
-        Includes creditable foreign-withholding buckets (e.g. KZ 998 / 799)
-        alongside income buckets so non-UI callers cannot accidentally miss
-        the credit side.
-
-        Raises :class:`ReportNotFileableError` if the report carries
-        blockers (``health.blockers`` non-empty) and ``allow_partial`` is
-        False — so a bulk-filing script cannot silently emit an incomplete
-        tax return.
+        Raises :class:`ReportNotFileableError` when blockers exist unless
+        ``allow_partial`` is True.
         """
         if self.health.blockers and not allow_partial:
             raise ReportNotFileableError(
@@ -136,14 +150,19 @@ class E1kvReport:
         for cb_name, amt in self.creditable_withholding.items():
             if amt == 0:
                 continue
-            kz = self._credit_kennzahlen.get(cb_name)
-            if kz is None:
-                continue
-            out[kz.nr] = out.get(kz.nr, Decimal("0")) + _q(amt)
+            kz = self.credit_kennzahlen[cb_name]
+            out[kz.nr] = out.get(kz.nr, ZERO) + _q(amt)
         return out
 
-    # Filled in by build_report so by_kennzahl can resolve credit-bucket → KZ.
-    _credit_kennzahlen: dict[str, Kennzahl] = field(default_factory=dict)
+
+@dataclass
+class _IncomeItem:
+    bucket: str
+    kz: Kennzahl
+    country: str | None
+    isin: str | None
+    amount: Decimal = ZERO  # gross income (EUR)
+    credit: Decimal = ZERO  # creditable before loss offset
 
 
 def build_report(
@@ -152,277 +171,486 @@ def build_report(
     rules: TaxRules,
     transactions: Iterable[Transaction],
     realized: Iterable[RealizedEvent],
+    brokers: BrokersConfig,
     pool_manager: PoolManager | None = None,
 ) -> E1kvReport:
     report = E1kvReport(year=year)
-    txns = [t for t in transactions if t.trade_date.year == year]
+    all_txns = list(transactions)
+    txns = [t for t in all_txns if t.trade_date.year == year]
     realized_list = [r for r in realized if r.trade_date.year == year]
-    used_kennzahlen: set[str] = set()
+    used: set[str] = set()
 
-    # ---- Invariant: every EUR amount we sum must come from ECB (or was
-    # natively EUR). Any broker-rate leakage is a correctness bug.
+    def credit_institution(broker: str) -> bool | None:
+        cfg = brokers.brokers.get(broker)
+        return None if cfg is None else cfg.credit_institution
+
+    # ---- Every EUR amount must come from the ECB (or be native EUR).
     for t in txns:
-        if t.amount_eur is None:
-            continue
-        if t.fx_rate_source not in {FxSource.ECB, FxSource.NATIVE_EUR}:
+        if t.amount_eur is not None and t.fx_rate_source not in {
+            FxSource.ECB,
+            FxSource.NATIVE_EUR,
+        }:
             report.health.blockers.append(
                 f"Transaction {t.broker} {t.source_file}:{t.source_line} "
                 f"uses non-ECB FX source {t.fx_rate_source.value!r}."
             )
 
-    # ---- Realized gains/losses (SELL events + RoC excess) → bucket via classify
+    # ---- Realized results → gain bucket, or its loss bucket if negative.
     for ev in realized_list:
-        bucket_name = rules.classify(TxType.SELL, ev.asset_class)
-        if bucket_name is None:
+        base = rules.classify(
+            TxType.SELL, ev.asset_class, credit_institution=credit_institution(ev.broker)
+        )
+        if base is None:
             continue
-        bucket_name = _realized_bucket_for_pnl(rules, bucket_name, ev.pnl_eur)
-        bucket = _get_or_create(report, rules, bucket_name)
-        used_kennzahlen.add(bucket_name)
+        kz = rules.kennzahlen[base]
+        name = kz.loss_bucket if ev.pnl_eur < 0 and kz.loss_bucket else base
+        bucket = _get_or_create(report, rules, name)
+        used.add(name)
         bucket.total_eur += ev.pnl_eur
         bucket.contributions.append(
             Contribution(
                 trade_date=ev.trade_date.isoformat(),
                 broker=ev.broker,
-                isin=ev.isin,
+                isin=ev.isin or ev.symbol,
                 name=ev.name,
                 amount_eur=ev.pnl_eur,
-                note=f"realized: proceeds={ev.proceeds_eur} cost={ev.cost_basis_eur}",
+                note=(
+                    f"{ev.kind}: proceeds={ev.proceeds_eur} cost={ev.cost_basis_eur} "
+                    f"[{ev.source_ref}]"
+                ),
             )
         )
 
-    # ---- Income transactions: dividends, interest
+    # ---- Income rows.
+    items: dict[tuple[str, str | None, str | None], _IncomeItem] = {}
     for tx in txns:
         if tx.tx_type is TxType.SELL:
-            continue  # handled above via realized events
-        # RoC uncertainty must be checked BEFORE the bucket=null skip:
-        # the pool has already reduced basis using the reported (possibly
-        # net-of-WHT) amount, so emitting a clean report would silently
-        # distort every future SELL's gain figure.
-        if tx.tx_type is TxType.RETURN_OF_CAPITAL and _parser_declared_roc_ambiguous(tx):
-            report.health.blockers.append(
-                f"Return-of-capital {tx.broker} {tx.source_file}:{tx.source_line} "
-                f"(ISIN {tx.isin or '?'}) may be net of foreign withholding. "
-                f"The pool reduced cost basis by the reported amount; this "
-                f"silently distorts future realized-gain figures. Verify "
-                f"against the broker's annual tax report and correct the row "
-                f"(or exclude it) before filing."
+            continue  # realized via the pool
+        if tx.tx_type is TxType.WITHHOLDING_TAX:
+            amt = abs(tx.tax_withheld_eur or tx.amount_eur or ZERO)
+            report.health.warnings.append(
+                f"Foreign tax {_q(amt)} EUR at {tx.broker} {tx.source_file}:"
+                f"{tx.source_line} ({tx.name or '-'}) is not attached to any "
+                f"income row and is NOT credited; reclaim it at source if "
+                f"refundable."
             )
-        bucket_name = rules.classify(tx.tx_type, tx.asset_class)
+            continue
+        bucket_name = rules.classify(
+            tx.tx_type, tx.asset_class, credit_institution=credit_institution(tx.broker)
+        )
         if bucket_name is None:
             continue
+        if tx.tx_type in _DIVIDEND_TYPES and _is_domestic(tx) and _domestic_kest(tx, report):
+            continue
+        kz = rules.kennzahlen[bucket_name]
         bucket = _get_or_create(report, rules, bucket_name)
-        used_kennzahlen.add(bucket_name)
-        # gross income amount in EUR (gross before withholding)
-        amt = tx.amount_eur or Decimal("0")
-        # Dividend gross-up: broker often reports the NET amount + withholding
-        # separately. The ``dividend_is_net`` flag disambiguates:
-        if tx.tx_type is TxType.DIVIDEND_CASH:
-            wh = tx.tax_withheld_eur or Decimal("0")
-            if wh != 0:
-                if tx.dividend_is_net is None:
-                    report.health.blockers.append(
-                        f"Dividend {tx.broker} {tx.source_file}:{tx.source_line} has "
-                        f"withholding {wh} but dividend_is_net is unset — parser must "
-                        f"declare NET or GROSS convention."
-                    )
-                elif tx.dividend_is_net:
-                    amt = amt + wh
-                # if dividend_is_net is False, gross_native already includes wh
-            elif _parser_declared_unknown_withholding(tx):
-                # Parser flagged that this broker's CSV does not disclose the
-                # foreign withholding tax. We cannot gross up and we cannot
-                # credit — silently summing the (net) amount would under-
-                # report income and forgo the KZ 998 credit. Block unless
-                # the treaty cap is zero (IE / GB outbound dividends), in
-                # which case nothing is lost.
-                country = (tx.withholding_country or "").upper()
-                country_cap = rules.foreign_withholding.country_caps.get(country)
-                effective_cap = (
-                    country_cap
-                    if country_cap is not None
-                    else rules.foreign_withholding.default_creditable_cap
-                )
-                if effective_cap > 0:
-                    report.health.blockers.append(
-                        f"Dividend {tx.broker} {tx.source_file}:{tx.source_line} "
-                        f"(country={tx.withholding_country or '?'}) is reported "
-                        f"net of foreign withholding, but the broker CSV does "
-                        f"not disclose the withholding amount. Gross-up and "
-                        f"KZ 998 credit cannot be computed from this row. "
-                        f"Supply the broker's annual tax report (with gross / "
-                        f"WHT broken out) or remove the row before filing."
-                    )
-        bucket.total_eur += amt
+        used.add(bucket_name)
+        gross, withheld = _gross_and_withholding(tx, report)
+        creditable = _creditable(rules, tx, kz, gross, withheld, report)
+        excess = withheld - creditable
+        bucket.total_eur += gross
         bucket.contributions.append(
             Contribution(
                 trade_date=tx.trade_date.isoformat(),
                 broker=tx.broker,
                 isin=tx.isin,
                 name=tx.name,
-                amount_eur=_q(amt),
+                amount_eur=_q(gross),
                 note=tx.tx_type.value,
+                withheld_eur=_q(withheld),
+                creditable_eur=_q(creditable),
+                country=tx.withholding_country,
             )
         )
-        # Withholding-tax credit. Cap = DBA ceiling × grossed-up income (`amt`
-        # has already been grossed-up above if the dividend was NET). Amount
-        # above the cap is recorded as ``uncreditable_withholding`` so the
-        # user knows to chase a refund from the source state.
-        if tx.tax_withheld_eur and tx.tax_withheld_eur != 0:
-            cap = _credit_cap(rules, tx)
-            wh_abs = abs(tx.tax_withheld_eur)
-            creditable = min(wh_abs, abs(amt) * cap)
-            excess = wh_abs - creditable
-            credit_bucket = _credit_bucket_for(rules, bucket_name)
-            if credit_bucket and credit_bucket in rules.kennzahlen:
-                report.creditable_withholding.setdefault(
-                    credit_bucket, Decimal("0")
-                )
-                report.creditable_withholding[credit_bucket] += _q(creditable)
-                report._credit_kennzahlen[credit_bucket] = rules.kennzahlen[credit_bucket]
-                used_kennzahlen.add(credit_bucket)
-                if excess > 0:
-                    report.uncreditable_withholding.setdefault(
-                        credit_bucket, Decimal("0")
-                    )
-                    report.uncreditable_withholding[credit_bucket] += _q(excess)
-
-    # Loss-offset note
-    if rules.loss_offset.cross_broker:
-        report.loss_offset_note = (
-            "Verlustausgleich angewandt: Realisierte Verluste werden mit "
-            "realisierten Gewinnen UND Dividenden im 27,5%-Topf saldiert (innerhalb "
-            "des Veranlagungsjahres, brokerübergreifend)."
+        if kz.credit_bucket and excess != 0:
+            report.uncreditable_withholding[kz.credit_bucket] = (
+                report.uncreditable_withholding.get(kz.credit_bucket, ZERO) + excess
+            )
+        key = (bucket_name, (tx.withholding_country or "").upper() or None, tx.isin)
+        item = items.setdefault(
+            key, _IncomeItem(bucket_name, kz, key[1], tx.isin)
         )
+        item.amount += gross
+        item.credit += creditable
 
-    # Apply intra-bucket loss offset already happens because we sum signed
-    # gains/losses into the realized bucket. Cross-bucket offset (losses
-    # within 27.5% across realized & dividends) → if the realized bucket is
-    # negative, allow it to reduce the dividend bucket within the same basket.
-    if rules.loss_offset.cross_bucket_within_275:
-        _apply_cross_bucket_within_275(report, rules)
+    _apply_loss_offset_and_credit(report, rules, list(items.values()), used)
 
-    # ---- ETF Meldefonds / ausschüttungsgleiche Erträge — out of scope for v1
+    # ---- Fund holdings: AgE / non-reporting-fund rules are not computed.
     etf_rows = [t for t in txns if t.asset_class is AssetClass.ETF]
     if etf_rows:
         isins = sorted({t.isin or t.symbol or "?" for t in etf_rows})
         report.health.blockers.append(
             f"{len(etf_rows)} ETF row(s) present for ISINs {isins!r}. "
-            "v1 does not compute ausschüttungsgleiche Erträge (OeKB Meldefonds) "
-            "or the 90%-Pauschale for Nicht-Meldefonds. The report is incomplete "
-            "for ETF positions — consult the OeKB fund-reporting database or a "
-            "steuereinfach broker before filing."
+            "ausschüttungsgleiche Erträge (KZ 937, OeKB Meldefonds), the "
+            "AgE cost-basis step-up (§ 186 Abs 3 InvFG), creditable fund-level "
+            "foreign tax and the Nicht-Meldefonds lump sum (90 %/10 %) are NOT "
+            "computed. The report is incomplete for these funds."
         )
-
-    # ---- Fund-prefix heuristic: catch ETFs misclassified as STOCK ----------
-    # Brokers that don't supply an asset-class field (Trading 212) fall back to
-    # STOCK for every ISIN. If the ISIN prefix strongly suggests a UCITS fund
-    # (IE00B*, LU0*, …), the user must add it to asset_class_overrides.yaml so
-    # the ETF blocker above can fire and the engine doesn't silently route
-    # Meldefonds positions into the stock realised-gains bucket.
-    stock_but_fund: list[str] = []
-    for t in txns:
-        # Explicit ISIN overrides in rules/asset_class_overrides.yaml are an
-        # intentional user decision and must silence this heuristic.
-        if asset_class_override_for(t.isin) is not None:
-            continue
-        if (
-            t.asset_class is AssetClass.STOCK
+    stock_but_fund = sorted(
+        {
+            t.isin
+            for t in txns
+            if t.isin
+            and t.asset_class is AssetClass.STOCK
+            and asset_class_override_for(t.isin) is None
             and isin_looks_like_fund(t.isin)
-            and t.isin not in stock_but_fund
-        ):
-            stock_but_fund.append(t.isin)
+        }
+    )
     if stock_but_fund:
         report.health.blockers.append(
-            f"ISIN(s) classified as STOCK but ISIN prefix suggests a UCITS "
-            f"fund/ETF: {stock_but_fund!r}. Add them to "
-            f"rules/asset_class_overrides.yaml with the correct AssetClass "
-            f"(ETF, BOND, …) so the engine applies Meldefonds treatment. "
-            f"If the ISIN is genuinely a stock (not a fund), add it as STOCK "
-            f"to silence this check."
+            f"ISIN(s) classified as STOCK but the ISIN prefix suggests a fund, "
+            f"ETC/ETN or certificate: {stock_but_fund!r}. Pin the correct class "
+            f"(ETF, DERIVATIVE for ETC/ETN/Zertifikate, BOND, STOCK) in "
+            f"rules/asset_class_overrides.yaml."
         )
 
-    # ---- TBV markers: any used Kennzahl that is still to-be-verified blocks
-    # final filing. (Unused `tbv: true` Kennzahlen do not block.)
-    tbv_used = [
-        rules.kennzahlen[bname] for bname in sorted(used_kennzahlen)
-        if bname in rules.kennzahlen and rules.kennzahlen[bname].tbv
-    ]
+    # ---- Unverified Kennzahlen that are actually used block filing.
+    tbv_used = [rules.kennzahlen[b] for b in sorted(used) if rules.kennzahlen[b].tbv]
     if tbv_used:
         report.health.blockers.append(
             "Unverified Kennzahl numbers: "
             + ", ".join(f"KZ {k.nr} ({k.label})" for k in tbv_used)
-            + ". Cross-check against the BMF E1kv-Erläuterungen for "
-            f"tax year {year} and clear `tbv: true` in rules/tax_{year}.yaml "
-            "before filing."
+            + f". Verify against the official BMF E 1kv {year} form "
+            f"({rules.form_source}) and clear `tbv: true` in rules/tax_{year}.yaml."
         )
 
-    # ---- Tolerant-mode exclusions from pool replay
-    if pool_manager is not None and pool_manager.errors:
-        for broker, isin, msg in pool_manager.errors:
-            report.health.excluded_isins.append((broker, isin, msg))
+    # ---- Row-level flags from parsers / declarations.
+    _surface_row_flags(report, txns)
+    # An unclassified share increase of an earlier year still shapes the cost
+    # basis of every later sale.
+    earlier = [
+        t for t in all_txns
+        if t.trade_date.year < year and any(f.code == FLAG_CA_UNCLASSIFIED for f in t.flags)
+    ]
+    if earlier:
         report.health.blockers.append(
-            f"{len(pool_manager.errors)} ISIN(s) excluded from realized-event "
-            "aggregation due to oversell/migration errors. Realized-gain totals "
-            "are INCOMPLETE. Resolve the errors (typically by importing earlier "
-            "data or supplying MIGRATION_IN cost basis) and re-run."
+            f"[{FLAG_CA_UNCLASSIFIED}] {len(earlier)} earlier corporate action(s) still "
+            "undeclared (stock dividend or split?) — they determine the cost basis: "
+            + ", ".join(f"{t.broker} {t.trade_date} {t.isin}" for t in earlier[:5])
         )
 
-    # ---- Same-ISIN-across-brokers warning. The engine keeps cost basis
-    # strictly per broker (EStR Rz 6144: "je Depot"). When the same ISIN
-    # appears in more than one broker pool, the user should verify that the
-    # per-depot methodology is the one they want — for non-steuereinfache
-    # foreign depots the literature is not unanimous on cross-depot pooling.
+    # ---- Pool state checks.
     if pool_manager is not None:
-        isin_to_brokers: dict[str, set[str]] = {}
-        for broker, pools in pool_manager.by_broker.items():
-            for isin, state in pools.by_isin.items():
-                if state.quantity == 0 and state.total_cost_eur == 0:
-                    continue
-                isin_to_brokers.setdefault(isin, set()).add(broker)
-        cross_broker_isins = sorted(
-            (isin, sorted(brokers))
-            for isin, brokers in isin_to_brokers.items()
-            if len(brokers) > 1
-        )
-        for isin, brokers in cross_broker_isins:
-            report.health.warnings.append(
-                f"ISIN {isin} is held at multiple brokers ({', '.join(brokers)}). "
-                "Cost basis is computed per broker ('je Depot' per EStR Rz 6144). "
-                "Verify that this is the methodology you intend to use; "
-                "cross-depot aggregation for non-steuereinfache foreign brokers "
-                "is not uniformly settled in the literature."
-            )
+        _pool_checks(report, pool_manager, year)
 
+    report.loss_offset_note = _loss_offset_note(report)
     return report
 
 
-def _detect_asset_class_for_realized(ev: RealizedEvent):  # pragma: no cover
-    # Deprecated: kept only as a backstop. Realized events now carry their
-    # originating asset_class so the YAML classifier sees the right value.
-    return ev.asset_class
+def _is_domestic(tx: Transaction) -> bool:
+    return (tx.withholding_country or "").upper() == "AT" or (tx.isin or "").startswith("AT")
 
 
-_WITHHOLDING_UNKNOWN_FLAG_CODES = frozenset({
-    # Trading 212 CSV exports do not break out foreign withholding tax on
-    # dividend rows; the "Total" column is already net. Without a paired
-    # annual tax report we cannot gross up or credit.
-    "t212.missing_withholding_detail",
-})
+def _domestic_kest(tx: Transaction, report: E1kvReport) -> bool:
+    """Austrian dividend: True if final-taxed by Austrian KESt (skip it)."""
+    gross, withheld = _gross_and_withholding(tx, report)
+    where = f"{tx.broker} {tx.source_file}:{tx.source_line} ({tx.isin or tx.name or '-'})"
+    if gross > 0 and abs(withheld / gross - _KEST_RATE) <= _KEST_TOLERANCE:
+        report.health.warnings.append(
+            f"Austrian dividend {where}: {_q(gross)} EUR with {_q(withheld)} EUR "
+            f"Austrian KESt is final-taxed (§ 97 EStG) and not reported. Optional: "
+            f"Regelbesteuerungs-/Verlustausgleichsoption via KZ 862/899 to offset "
+            f"losses against it."
+        )
+        return True
+    report.health.blockers.append(
+        f"Austrian dividend {where}: {_q(gross)} EUR without a 27,5 % KESt deduction "
+        f"(withheld {_q(withheld)} EUR) — domestic income without KESt must be "
+        f"declared manually."
+    )
+    return True
 
-_ROC_AMBIGUOUS_FLAG_CODES = frozenset({
-    # Trading 212 RoC rows may be net of foreign withholding. The pool
-    # reduces basis by the reported value, so a net figure silently
-    # inflates future realized gains.
-    "t212.roc_net_gross_ambiguous",
-})
+
+def _gross_and_withholding(tx: Transaction, report: E1kvReport) -> tuple[Decimal, Decimal]:
+    """Gross income (EUR) and foreign tax withheld (EUR, refunds negative)."""
+    amt = tx.amount_eur or ZERO
+    withheld = tx.tax_withheld_eur or ZERO
+    if withheld == 0:
+        return amt, ZERO
+    if tx.dividend_is_net is None:
+        report.health.blockers.append(
+            f"{tx.tx_type.value} {tx.broker} {tx.source_file}:{tx.source_line} has "
+            f"withholding {withheld} but no NET/GROSS convention (dividend_is_net) — "
+            f"the parser must declare it."
+        )
+        return amt, withheld
+    return (amt + withheld if tx.dividend_is_net else amt), withheld
 
 
-def _parser_declared_unknown_withholding(tx: Transaction) -> bool:
-    return any(f.code in _WITHHOLDING_UNKNOWN_FLAG_CODES for f in tx.flags)
+def _creditable(
+    rules: TaxRules,
+    tx: Transaction,
+    kz: Kennzahl,
+    gross: Decimal,
+    withheld: Decimal,
+    report: E1kvReport,
+) -> Decimal:
+    """Creditable foreign tax of one row before loss offset (sign of gross)."""
+    fw = rules.foreign_withholding
+    country = (tx.withholding_country or "").upper()
+    flags = {f.code for f in tx.flags}
+    where = f"{tx.broker} {tx.source_file}:{tx.source_line} ({tx.isin or tx.name or '-'})"
+
+    if FLAG_WHT_NOT_DISCLOSED in flags and tx.tx_type in _DIVIDEND_TYPES:
+        cap = fw.dividend_caps.get(country)
+        if cap is None or cap > 0:
+            report.health.blockers.append(
+                f"Dividend {where}: the export does not disclose the foreign tax "
+                f"withheld (country {country or '?'}), so the gross income and the "
+                f"KZ 998 credit cannot be computed. Use an export that includes "
+                f"the withholding-tax columns."
+            )
+    if withheld == 0:
+        return ZERO
+    rate = kz.rate
+    if kz.credit_bucket is None or rate is None:
+        report.health.warnings.append(
+            f"Foreign tax {_q(withheld)} EUR on {where} cannot be credited "
+            f"(income type without credit Kennzahl)."
+        )
+        return ZERO
+    cap = ZERO
+    for code, why in _NO_CREDIT_FLAGS.items():
+        if code in flags:
+            report.health.warnings.append(
+                f"Foreign tax {_q(withheld)} EUR on {where} not credited: {why}."
+            )
+            return ZERO
+    if tx.asset_class is AssetClass.ETF:
+        report.health.warnings.append(
+            f"Foreign tax {_q(withheld)} EUR on fund distribution {where} not "
+            f"credited: creditable fund-level tax comes from the OeKB report."
+        )
+        return ZERO
+    if tx.tx_type in _INTEREST_TYPES:
+        cap = fw.interest_caps.get(country, ZERO) if country else ZERO
+        if cap == 0:
+            report.health.warnings.append(
+                f"Foreign tax {_q(withheld)} EUR on interest {where} is not "
+                f"creditable (no DBA source-taxation right on interest configured); "
+                f"reclaim it from the source state."
+            )
+            return ZERO
+    elif tx.tx_type not in _DIVIDEND_TYPES:
+        report.health.warnings.append(
+            f"Foreign tax {_q(withheld)} EUR on {tx.tx_type.value} {where} is not credited."
+        )
+        return ZERO
+    if FLAG_WHT_COUNTRY_UNCERTAIN in flags or not country:
+        report.health.blockers.append(
+            f"Foreign tax {_q(withheld)} EUR on {where}: the withholding source "
+            f"country is unknown (e.g. ADR/GDR whose ISIN country differs from "
+            f"the issuer's). Declare it in rules/withholding_countries.yaml."
+        )
+        return ZERO
+    if country in fw.manual_review_countries:
+        report.health.blockers.append(
+            f"Foreign tax {_q(withheld)} EUR on {where}: treaty with {country} "
+            f"is suspended — credit only via § 48 Abs 5 BAO; handle manually."
+        )
+        return ZERO
+    if tx.tx_type in _DIVIDEND_TYPES:
+        dcap = fw.dividend_caps.get(country)
+        if dcap is None:
+            report.health.blockers.append(
+                f"Foreign tax {_q(withheld)} EUR on {where}: no DBA dividend rate "
+                f"for {country} in rules/tax_{rules.year}.yaml. Add the treaty's "
+                f"portfolio-dividend rate (or 0 if not creditable)."
+            )
+            return ZERO
+        cap = dcap
+    if cap == 0:
+        return ZERO
+    limit = abs(gross) * min(cap, rate)
+    credit = min(abs(withheld), limit)
+    return credit if gross >= 0 else -credit
 
 
-def _parser_declared_roc_ambiguous(tx: Transaction) -> bool:
-    return any(f.code in _ROC_AMBIGUOUS_FLAG_CODES for f in tx.flags)
+def _apply_loss_offset_and_credit(
+    report: E1kvReport,
+    rules: TaxRules,
+    items: list[_IncomeItem],
+    used: set[str],
+) -> None:
+    summary = report.loss_offset
+    section = {n for n, kz in rules.kennzahlen.items() if kz.loss_offset}
+    summary.saldo_1_3_eur = _q(
+        sum((b.total_eur for n, b in report.buckets.items() if n in section), ZERO)
+    )
+    losses = -sum(
+        (
+            b.total_eur
+            for n, b in report.buckets.items()
+            if b.kennzahl.kind is BucketKind.LOSS and n in section
+        ),
+        ZERO,
+    )
+    # Net-negative income (e.g. reversals) also has to be offset.
+    losses += sum((-i.amount for i in items if i.amount < 0 and i.bucket in section), ZERO)
+    summary.losses_eur = _q(losses)
+
+    lost_credit: dict[int, Decimal] = defaultdict(lambda: ZERO)
+    absorbed_income: dict[int, Decimal] = defaultdict(lambda: ZERO)
+    # Anm 19: losses go against Überschüsse at the highest special rate
+    # (27,5 %) first; lower-rate (25 %) Überschüsse come last.
+    section_gains = [
+        b for n, b in report.buckets.items()
+        if n in section and b.kennzahl.kind is BucketKind.GAIN and b.kennzahl.rate is not None
+    ]
+    top_rate = max((b.kennzahl.rate or ZERO for b in section_gains), default=ZERO)
+    gains_27 = [b.total_eur for b in section_gains if b.kennzahl.rate == top_rate]
+    gains_25 = [
+        b.total_eur
+        for b in sorted(section_gains, key=lambda b: b.kennzahl.rate or ZERO, reverse=True)
+        if b.kennzahl.rate != top_rate
+    ]
+    offsettable = [
+        (idx, it) for idx, it in enumerate(items) if it.bucket in section and it.amount > 0
+    ]
+    no_credit = [(i, it) for i, it in offsettable if it.credit <= 0]
+    with_credit = sorted(
+        ((i, it) for i, it in offsettable if it.credit > 0),
+        key=lambda p: p[1].credit / p[1].amount,
+    )
+    remaining = losses
+    for g in gains_27:
+        take = min(remaining, max(g, ZERO))
+        remaining -= take
+    for idx, it in no_credit + with_credit:
+        take = min(remaining, it.amount)
+        if take <= 0:
+            break
+        remaining -= take
+        absorbed_income[idx] = take
+        if it.credit > 0:
+            lost_credit[idx] = it.credit * take / it.amount
+    for g in gains_25:
+        take = min(remaining, max(g, ZERO))
+        remaining -= take
+    summary.absorbed_eur = _q(losses - remaining)
+    summary.unabsorbed_eur = _q(remaining)
+    if remaining > 0:
+        report.health.warnings.append(
+            f"{_q(remaining)} EUR of losses exceed the offsettable income and are "
+            f"lost (no loss carry-forward for private investors, § 27 Abs 8 EStG)."
+        )
+
+    # Per credit bucket and source country: credit after offset, capped at
+    # the Austrian tax on that country's remaining income.
+    per_country: dict[tuple[str, str | None], list[Decimal]] = defaultdict(
+        lambda: [ZERO, ZERO, ZERO]
+    )  # credit after offset, tax ceiling, credit lost
+    for idx, it in enumerate(items):
+        cb = it.kz.credit_bucket
+        if cb is None or it.kz.rate is None:
+            continue
+        after_income = it.amount - absorbed_income[idx]
+        acc = per_country[(cb, it.country)]
+        acc[0] += it.credit - lost_credit[idx]
+        acc[1] += max(after_income, ZERO) * it.kz.rate
+        acc[2] += lost_credit[idx]
+    for (cb, _country), (credit, ceiling, lost) in sorted(
+        per_country.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")
+    ):
+        capped = min(credit, ceiling) if credit > 0 else credit
+        lost += credit - capped
+        if capped == 0 and lost == 0:
+            continue
+        report.creditable_withholding[cb] = report.creditable_withholding.get(cb, ZERO) + capped
+        report.credit_kennzahlen[cb] = rules.kennzahlen[cb]
+        used.add(cb)
+        if lost:
+            report.credit_lost_to_loss_offset[cb] = (
+                report.credit_lost_to_loss_offset.get(cb, ZERO) + lost
+            )
+    for cb, amt in report.creditable_withholding.items():
+        report.creditable_withholding[cb] = _q(amt)
+        if amt < 0:
+            report.health.blockers.append(
+                f"Net creditable foreign tax for {cb} is negative ({_q(amt)} EUR): "
+                f"refunds of tax credited in an earlier year must be corrected there."
+            )
+    for d in (report.uncreditable_withholding, report.credit_lost_to_loss_offset):
+        for cb in d:
+            d[cb] = _q(d[cb])
+
+
+def _loss_offset_note(report: E1kvReport) -> str:
+    s = report.loss_offset
+    lost = sum(report.credit_lost_to_loss_offset.values(), ZERO)
+    return (
+        "Gewinne und Verluste sind getrennt (nicht saldiert) eingetragen; der "
+        "Verlustausgleich erfolgt durch das Finanzamt (E 1kv Anm 19). "
+        f"Saldo aus Punkt 1.3: {s.saldo_1_3_eur} EUR. Verluste {s.losses_eur} EUR, "
+        f"davon ausgleichsfähig {s.absorbed_eur} EUR. Durch den Verlustausgleich "
+        f"nicht mehr anrechenbare Quellensteuer: {_q(lost)} EUR (EStR Rz 7752h; "
+        "Verrechnung zuerst mit 27,5 %-Überschüssen und Einkünften ohne "
+        "Quellensteuer)."
+    )
+
+
+def _surface_row_flags(report: E1kvReport, txns: list[Transaction]) -> None:
+    grouped: dict[tuple[Severity, str], list[Transaction]] = defaultdict(list)
+    for t in txns:
+        for f in t.flags:
+            if f.severity in (Severity.WARNING, Severity.ERROR):
+                grouped[(f.severity, f.code)].append(t)
+    for (sev, code), rows in sorted(grouped.items(), key=lambda kv: kv[0][1]):
+        first = rows[0]
+        msg = next(f.message for f in first.flags if f.code == code)
+        refs = ", ".join(f"{t.source_file}:{t.source_line}" for t in rows[:3])
+        more = f" (+{len(rows) - 3} more)" if len(rows) > 3 else ""
+        text = f"[{code}] {len(rows)} row(s): {msg} — e.g. {refs}{more}"
+        (report.health.blockers if sev is Severity.ERROR else report.health.warnings).append(text)
+
+
+def _pool_checks(report: E1kvReport, pm: PoolManager, year: int) -> None:
+    # Errors after the tax year do not affect it (realizations before an
+    # error are computed from complete history); unmatched exchange legs
+    # (date.max) affect every year.
+    relevant = [e for e in pm.errors if e[3].year <= year or e[3] == date.max]
+    later = len(pm.errors) - len(relevant)
+    if later:
+        report.health.warnings.append(
+            f"{later} pool error(s) dated after {year} (e.g. undeclared transfers or "
+            "corporate actions) — they do not affect this year but block later years."
+        )
+    if relevant:
+        report.health.excluded_isins.extend(relevant)
+        report.health.blockers.append(
+            f"{len(relevant)} pool error(s) (oversell, unknown basis, undeclared "
+            "corporate action or depot transfer). Affected ISINs are excluded from "
+            "the error date on; realized totals are INCOMPLETE: "
+            + "; ".join(f"{b}/{i}: {m.splitlines()[0][:160]}" for b, i, m, _ in relevant[:5])
+        )
+    for when, msg in pm.basis_mismatches:
+        if when.year <= year:
+            report.health.warnings.append(msg)
+    isin_to_brokers: dict[str, set[str]] = defaultdict(set)
+    for broker, pools in pm.by_broker.items():
+        for isin, state in pools.by_isin.items():
+            if state.quantity != 0:
+                isin_to_brokers[isin].add(broker)
+            if state.quantity != 0 and not state.cost_basis_known:
+                report.health.warnings.append(
+                    f"{broker}/{isin}: {state.quantity} units with UNKNOWN cost basis "
+                    "(undeclared transfer-in); a sale will fail until declared."
+                )
+    for isin, brokers in sorted(isin_to_brokers.items()):
+        if len(brokers) > 1:
+            report.health.warnings.append(
+                f"ISIN {isin} is held at several depots ({', '.join(sorted(brokers))}); "
+                "cost basis is kept per depot (§ 27a Abs 4 Z 3 EStG)."
+            )
+    for broker, pools in pm.by_broker.items():
+        for ccy, st in pools.fx.items():
+            if st.liability > 0 and st.quantity == 0:
+                report.health.warnings.append(
+                    f"{broker}: {ccy} balance is negative ({-st.liability}) at the end "
+                    "of the replay (margin loan). FX effects on debts are not taxable; "
+                    "if the export does not start at account opening, an opening "
+                    f"{ccy} balance may be missing and FX gains understated."
+                )
 
 
 def _get_or_create(report: E1kvReport, rules: TaxRules, bucket_name: str) -> BucketResult:
@@ -431,65 +659,3 @@ def _get_or_create(report: E1kvReport, rules: TaxRules, bucket_name: str) -> Buc
             bucket=bucket_name, kennzahl=rules.kennzahl(bucket_name)
         )
     return report.buckets[bucket_name]
-
-
-def _credit_cap(rules: TaxRules, tx: Transaction) -> Decimal:
-    # Filing guardrail: creditable foreign withholding is globally capped at
-    # 15% of gross income, independent of source country. Per-country DBA
-    # caps (e.g. JP: 10%) are applied when the transaction carries a
-    # ``withholding_country``; they can only LOWER the effective cap, never
-    # raise it above the Austrian 15% ceiling. A user-configured default
-    # above 15% is likewise clamped.
-    default_cap = rules.foreign_withholding.default_creditable_cap
-    country = (tx.withholding_country or "").upper()
-    country_cap = (
-        rules.foreign_withholding.country_caps.get(country) if country else None
-    )
-    effective = country_cap if country_cap is not None else default_cap
-    return min(effective, MAX_CREDITABLE_WITHHOLDING_CAP)
-
-
-def _credit_bucket_for(rules: TaxRules, bucket_name: str) -> str | None:
-    """Map an income bucket to its corresponding withholding-credit bucket.
-
-    First consults ``Kennzahl.credit_bucket`` declared in YAML. Falls back to
-    a name-substring heuristic so legacy YAMLs without the explicit field keep
-    working, but the YAML-declared mapping always wins when present.
-    """
-    kz = rules.kennzahlen.get(bucket_name)
-    if kz is not None and kz.credit_bucket:
-        return kz.credit_bucket
-    if "27_5" in bucket_name:
-        return "anrechenbare_quellensteuer_27_5"
-    if "_25" in bucket_name:
-        return "anrechenbare_quellensteuer_25"
-    return None
-
-
-def _apply_cross_bucket_within_275(report: E1kvReport, rules: TaxRules) -> None:
-    buckets = rules.loss_offset.cross_bucket_within_275_buckets
-    if len(buckets) < 2:
-        return
-    src_name, *targets = buckets
-    src = report.buckets.get(src_name)
-    if src is None or src.total_eur >= 0:
-        return
-    for target_name in targets:
-        target = report.buckets.get(target_name)
-        if target is None or target.total_eur <= 0:
-            continue
-        offset = min(abs(src.total_eur), target.total_eur)
-        target.total_eur -= offset
-        src.total_eur += offset
-        target.contributions.append(
-            Contribution(
-                trade_date="-",
-                broker="-",
-                isin=None,
-                name="Verlustausgleich aus realisierten Verlusten",
-                amount_eur=-_q(offset),
-                note=f"cross-bucket within 27.5% basket (from {src_name})",
-            )
-        )
-        if src.total_eur >= 0:
-            return

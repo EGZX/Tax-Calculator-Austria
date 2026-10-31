@@ -16,11 +16,12 @@ from __future__ import annotations
 import csv
 import io
 import sqlite3
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import requests
 
+from ..model import FxRateMissingError
 from ..store import get_fx_rate, put_fx_rates
 
 ECB_URL = "https://data-api.ecb.europa.eu/service/data/EXR/D.{ccy}.EUR.SP00.A"
@@ -36,12 +37,7 @@ def _parse_ecb_csv(text: str) -> dict[date, Decimal]:
         v_raw = row.get("OBS_VALUE") or row.get("OBS VALUE")
         if not d_raw or not v_raw:
             continue
-        try:
-            d = date.fromisoformat(d_raw)
-            v = Decimal(v_raw)
-        except Exception:
-            continue
-        out[d] = v
+        out[date.fromisoformat(d_raw)] = Decimal(v_raw)
     return out
 
 
@@ -92,16 +88,50 @@ def ensure_currency_cached(
         # rate is still serviceable by the lookup backoff.
         if target_date <= max_cached + timedelta(days=7):
             return
-    rates = fetch_ecb_series(currency)
+    try:
+        rates = fetch_ecb_series(currency)
+    except requests.RequestException as e:
+        raise FxRateMissingError(
+            f"ECB rates for {currency} up to {target_date} are not cached and the ECB "
+            f"API is unreachable ({type(e).__name__}). Load the official history file "
+            f"with tax_calc_at.fx.ecb.load_ecb_history_csv() or retry online."
+        ) from e
     if not rates:
-        raise RuntimeError(f"ECB returned no data for {currency}")
+        raise FxRateMissingError(f"ECB returned no data for {currency}")
     put_fx_rates(
         conn,
         currency.upper(),
         rates,
         source="ECB",
-        fetched_at=datetime.now(timezone.utc).isoformat(),
+        fetched_at=datetime.now(UTC).isoformat(),
     )
+
+
+def load_ecb_history_csv(conn: sqlite3.Connection, path: str | io.TextIOBase) -> int:
+    """Seed the cache from the ECB's official ``eurofxref-hist.csv``.
+
+    Format: ``Date,USD,JPY,…`` with ``N/A`` for unpublished values — the file
+    behind https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip. For
+    offline use or reproducible runs; the data is the same ECB reference
+    rate series the API serves. Returns the number of rates stored.
+    """
+    text = (
+        path.read() if isinstance(path, io.TextIOBase)
+        else open(path, encoding="utf-8").read()  # noqa: SIM115
+    )
+    by_ccy: dict[str, dict[date, Decimal]] = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        d = date.fromisoformat((row.pop("Date") or "").strip())
+        for ccy, raw in row.items():
+            ccy = (ccy or "").strip().upper()
+            val = (raw or "").strip()
+            if len(ccy) != 3 or not val or val == "N/A":
+                continue
+            by_ccy.setdefault(ccy, {})[d] = Decimal(val)
+    stamp = datetime.now(UTC).isoformat()
+    for ccy, rates in by_ccy.items():
+        put_fx_rates(conn, ccy, rates, source="ECB", fetched_at=stamp)
+    return sum(len(r) for r in by_ccy.values())
 
 
 def lookup_rate(conn: sqlite3.Connection, currency: str, on: date) -> Decimal | None:

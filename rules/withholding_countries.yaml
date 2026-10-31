@@ -1,0 +1,17 @@
+# Public template. Put YOUR entries into rules/local/withholding_countries.yaml
+# (git-ignored); both files are combined.
+#
+# Source country of foreign withholding tax per ISIN, where the ISIN prefix
+# is NOT the taxing state — typically depositary receipts (ADR/GDR: US ISIN,
+# foreign issuer) or companies taxed in another state than their ISIN.
+# The country decides the DBA cap for the KZ 998 credit. Parsers block a
+# report with withheld tax on depositary receipts until it is declared here.
+#
+# Every entry must match imported transactions (typos fail loudly).
+#
+# Example:
+#   withholding_countries:
+#     US8740391003: TW   # Taiwan Semiconductor ADR — Taiwanese tax (DBA 10 %)
+#     US0595781040: BR   # Banco do Brasil ADR
+
+withholding_countries: {}

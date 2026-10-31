@@ -6,21 +6,21 @@ day (see ``ecb.lookup_rate``). If the rate is missing, raises
 :class:`FxRateMissingError` — never silently falls back to a broker-supplied
 rate.
 
-FX reference date:
-    * Acquisitions / disposals (BUY, SELL, SPLIT, BONUS_SHARE, MIGRATION_*):
-      :attr:`Transaction.trade_date` (Anschaffungs-/Veräußerungszeitpunkt,
-      § 27a Abs. 3 EStG).
-    * Income events (DIVIDEND_CASH, INTEREST, RETURN_OF_CAPITAL, FEE):
-      :attr:`Transaction.settle_date` if provided (Zuflusstag), else
-      :attr:`Transaction.trade_date`.
+FX reference date (EStR Rz 6201c: ECB reference rate):
+    * Acquisitions / disposals / conversions: :attr:`Transaction.trade_date`.
+    * Income and cash events: :attr:`Transaction.settle_date` if provided
+      (Zuflusstag), else :attr:`Transaction.trade_date`.
+
+Where a broker actually converted into EUR, the actual rate is applied by
+the foreign-currency cash ledger (:mod:`tax_calc_at.pool`), not here.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from datetime import date
-from decimal import Decimal, ROUND_HALF_EVEN
-from typing import Iterable
+from decimal import ROUND_HALF_EVEN, Decimal
 
 from ..model import FxRateMissingError, FxSource, Severity, Transaction, TxType
 from .ecb import lookup_rate
@@ -31,7 +31,10 @@ _INCOME_TYPES = {
     TxType.DIVIDEND_CASH,
     TxType.INTEREST,
     TxType.INTEREST_OTHER,
+    TxType.CASHBACK,
+    TxType.PROMO_BONUS,
     TxType.RETURN_OF_CAPITAL,
+    TxType.WITHHOLDING_TAX,
     TxType.FEE,
 }
 

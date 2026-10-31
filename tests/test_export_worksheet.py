@@ -13,10 +13,8 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-import pytest
-
 from tax_calc_at.engine.e1kv import build_report
-from tax_calc_at.engine.rules import load_tax_rules
+from tax_calc_at.engine.rules import load_brokers, load_tax_rules
 from tax_calc_at.export import build_worksheet
 from tax_calc_at.model import AssetClass, FxSource, Transaction, TxType
 from tax_calc_at.pool import PoolManager
@@ -101,6 +99,7 @@ def test_worksheet_contains_all_expected_files(tmp_path: Path) -> None:
         transactions=txns,
         realized=pm.realized_events(),
         pool_manager=pm,
+        brokers=load_brokers(),
     )
     bundle = build_worksheet(
         year=2024, rules=rules, report=report, year_txns=txns, pool_manager=pm
@@ -136,6 +135,7 @@ def test_worksheet_summary_includes_realized_gain_and_dividend() -> None:
         transactions=txns,
         realized=pm.realized_events(),
         pool_manager=pm,
+        brokers=load_brokers(),
     )
     bundle = build_worksheet(
         year=2024, rules=rules, report=report, year_txns=txns, pool_manager=pm
@@ -178,6 +178,7 @@ def test_worksheet_flags_not_fileable_when_blockers_present() -> None:
         transactions=txns,
         realized=pm.realized_events(),
         pool_manager=pm,
+        brokers=load_brokers(),
     )
     # Inject a synthetic blocker to simulate an incomplete run.
     report.health.blockers.append("Unit test: pretend Meldefonds data missing")
@@ -211,6 +212,7 @@ def test_worksheet_csv_uses_austrian_locale_format() -> None:
         transactions=txns,
         realized=pm.realized_events(),
         pool_manager=pm,
+        brokers=load_brokers(),
     )
     bundle = build_worksheet(
         year=2024, rules=rules, report=report, year_txns=txns, pool_manager=pm

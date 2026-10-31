@@ -33,10 +33,10 @@ import csv
 import html
 import io
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterable
 
 from .engine.e1kv import E1kvReport
 from .engine.rules import TaxRules
@@ -136,12 +136,23 @@ def _summary_csv(year: int, rules: TaxRules, report: E1kvReport) -> str:
     for cb, amt in report.uncreditable_withholding.items():
         rows.append([
             "-",
-            f"Nicht anrechenbarer Überschuss ({cb})",
+            f"Nicht anrechenbar – über DBA-Satz ({cb})",
             cb,
             _fmt_dec(amt),
-            "(DBA-Überschreitung; ggf. im Quellenstaat rückforderbar)",
+            "(nicht eintragen; ggf. im Quellenstaat rückforderbar)",
             "",
         ])
+    for cb, amt in report.credit_lost_to_loss_offset.items():
+        rows.append([
+            "-",
+            f"Nicht anrechenbar – durch Verlustausgleich ({cb})",
+            cb,
+            _fmt_dec(amt),
+            "(EStR Rz 7752h; bereits von KZ abgezogen)",
+            "",
+        ])
+    lo = report.loss_offset
+    rows.append(["-", "Saldo aus Punkt 1.3 (informativ)", "-", _fmt_dec(lo.saldo_1_3_eur), "", ""])
     _w(
         buf,
         ["KZ", "Bezeichnung", "Bucket", "Betrag_EUR", "Posten", "TBV"],
@@ -278,11 +289,15 @@ def _contributions_csv(report: E1kvReport) -> str:
                 c.isin or "",
                 (c.name or "").replace(_CSV_DELIM, ","),
                 _fmt_dec(c.amount_eur),
+                _fmt_dec(c.withheld_eur),
+                _fmt_dec(c.creditable_eur),
+                c.country or "",
                 c.note,
             ])
     _w(
         buf,
-        ["KZ", "bucket", "trade_date", "broker", "isin", "name", "amount_eur", "note"],
+        ["KZ", "bucket", "trade_date", "broker", "isin", "name", "amount_eur",
+         "withheld_eur", "creditable_before_offset_eur", "wh_country", "note"],
         rows,
     )
     return buf.getvalue()
@@ -295,8 +310,9 @@ def _health_csv(report: E1kvReport) -> str:
         rows.append(["BLOCKER", b.replace(_CSV_DELIM, ",")])
     for w in report.health.warnings:
         rows.append(["WARNING", w.replace(_CSV_DELIM, ",")])
-    for broker, isin, msg in report.health.excluded_isins:
-        rows.append(["EXCLUDED", f"{broker}/{isin}: {msg.splitlines()[0]}".replace(_CSV_DELIM, ",")])
+    for broker, isin, msg, _d in report.health.excluded_isins:
+        text = f"{broker}/{isin} ({_d}): {msg.splitlines()[0]}"
+        rows.append(["EXCLUDED", text.replace(_CSV_DELIM, ",")])
     _w(buf, ["severity", "message"], rows)
     return buf.getvalue()
 
@@ -306,7 +322,7 @@ def _fx_trail_csv(txns: list[Transaction]) -> str:
     seen: set[tuple[str, str, str]] = set()
     rows: list[list[str]] = []
     for t in sorted(txns, key=lambda x: x.trade_date):
-        if t.fx_rate_used is None:
+        if t.fx_rate_used is None or t.fx_rate_source.value == "NATIVE_EUR":
             continue
         ref_date = (t.settle_date or t.trade_date).isoformat()
         key = (t.currency_native, ref_date, t.fx_rate_source.value)
@@ -356,13 +372,14 @@ def _index_html(
     out.append(
         f"<p><small>Generiert {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
         f"Engine v0.1 · Nicht-steuereinfache Auslandsbroker · "
-        "Tausende in der CSV werden mit <code>;</code> getrennt, Dezimalzeichen <code>,</code>.</small></p>"
+        "CSV-Trennzeichen <code>;</code>, Dezimalzeichen <code>,</code>.</small></p>"
     )
     if report.health.fileable:
         out.append("<div class='ok'>✅ Automatisierte Prüfungen bestanden. <strong>Ersetzt keine "
                    "Kontrolle durch Steuerberater:in.</strong></div>")
     else:
-        out.append("<div class='blocker'>🚫 <strong>Bericht ist NICHT zur Abgabe freigegeben.</strong> "
+        out.append("<div class='blocker'>🚫 <strong>Bericht ist NICHT zur Abgabe "
+                   "freigegeben.</strong> "
                    "Blocker unten beheben und neu exportieren.</div>")
     for b in report.health.blockers:
         out.append(f"<div class='blocker'>{esc(b)}</div>")
@@ -494,12 +511,16 @@ def _readme_txt(year: int) -> str:
         "  Encoding:           UTF-8 mit BOM (Excel-kompatibel)\n\n"
         "Methodik (Kurzfassung):\n"
         "  - Gleitender Durchschnittspreis je Broker je ISIN (§ 27a Abs. 4 EStG).\n"
-        "  - Fees sind NICHT in den Anschaffungskosten enthalten (§ 20 Abs. 2 EStG,\n"
-        "    Werbungskostenabzugsverbot beim Sondersteuersatz).\n"
-        "  - FX: ECB-Referenzkurs am Handelstag (Einkünfte: Zufluss-/Settle-Datum\n"
-        "    per § 19 EStG).\n"
-        "  - Quellensteuer-Anrechnung: gekappt auf DBA-Höchstsatz; Überschuss in\n"
-        "    06_health.csv ausgewiesen (ggf. im Quellenstaat rückforderbar).\n\n"
+        "  - Spesen sind NICHT in Anschaffungskosten/Erlös enthalten (§ 27a Abs. 4 Z 2,\n"
+        "    § 20 Abs. 2 EStG).\n"
+        "  - FX: EZB-Referenzkurs (Wertpapiere am Handelstag, Erträge am Zuflusstag);\n"
+        "    Fremdwährungsguthaben als eigenes Wirtschaftsgut mit gleitendem\n"
+        "    Durchschnitt, tatsächliche Konvertierung in EUR zum tatsächlichen Kurs\n"
+        "    (EStR Rz 6201–6201c).\n"
+        "  - Gewinne und Verluste getrennt (nicht saldiert); Verlustausgleich durch\n"
+        "    das Finanzamt. Anrechenbare Quellensteuer: max. DBA-Satz und österr.\n"
+        "    Steuer, gekürzt um den durch Verlustausgleich verrechneten Teil\n"
+        "    (EStR Rz 7752h).\n\n"
         "Haftung: Automatisierte Auswertung, kein Ersatz für steuerliche Beratung.\n"
-        "ETF-/Meldefonds-Erträge werden NICHT berechnet.\n"
+        "ETF-/Meldefonds-Erträge (ausschüttungsgleiche Erträge) werden NICHT berechnet.\n"
     )
